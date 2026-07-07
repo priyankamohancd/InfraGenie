@@ -1,0 +1,5 @@
+Id,Name,Shape Library,Page ID,Contained By,Group,Source,Target,Text Area 1,Width,Height,X,Y
+sg-1,Security Group,AWS19,page1,,,,,Database Security Group,400,250,50,50
+rds-1,RDS Instance,AWS19 / Database,page1,sg-1,,,,Orders DB,150,100,100,120
+sns-1,SNS Topic,AWS19 / App Integration,page1,,,,,Order Notifications,150,100,500,120
+edge-1,,,page1,,,rds-1,sns-1,replicates to,,,,
