@@ -1,0 +1,2142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>arch2terraform — Diagram to Infrastructure</title>
+  <style>
+    /* ── Design tokens ───────────────────────────────────────────── */
+    :root {
+      --bg:          #0d1117;
+      --surface:     #161b22;
+      --surface2:    #1c2128;
+      --border:      #30363d;
+      --border-hi:   #484f58;
+      --text:        #e6edf3;
+      --text-muted:  #8b949e;
+      --text-dim:    #6e7681;
+      --accent:      #f78166;       /* terraform orange-red */
+      --accent-dim:  #3d1f1b;
+      --green:       #3fb950;
+      --green-dim:   #1a3a1f;
+      --yellow:      #d29922;
+      --yellow-dim:  #2e2209;
+      --blue:        #58a6ff;
+      --blue-dim:    #0d2c52;
+      --purple:      #bc8cff;
+      --radius:      8px;
+      --radius-lg:   12px;
+      --mono:        'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+      --sans:        -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      min-height: 100vh;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    /* ── Layout ──────────────────────────────────────────────────── */
+    .header {
+      border-bottom: 1px solid var(--border);
+      padding: 16px 32px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      position: sticky;
+      top: 0;
+      background: var(--bg);
+      z-index: 100;
+    }
+    .logo { font-family: var(--mono); font-size: 18px; font-weight: 700; color: var(--accent); }
+    .logo span { color: var(--text-muted); font-weight: 400; }
+    .header-badge {
+      margin-left: auto;
+      font-size: 11px;
+      font-family: var(--mono);
+      color: var(--text-dim);
+      border: 1px solid var(--border);
+      padding: 2px 8px;
+      border-radius: 20px;
+    }
+
+    main { max-width: 960px; margin: 0 auto; padding: 40px 24px; }
+
+    /* ── Screens ─────────────────────────────────────────────────── */
+    .screen { display: none; animation: fadeIn 0.2s ease; }
+    .screen.active { display: block; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+    /* ── Progress steps ──────────────────────────────────────────── */
+    .steps {
+      display: flex;
+      gap: 0;
+      margin-bottom: 40px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .step {
+      flex: 1;
+      padding: 10px 16px;
+      font-size: 12px;
+      color: var(--text-dim);
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--mono);
+    }
+    .step:last-child { border-right: none; }
+    .step.active { color: var(--accent); background: var(--accent-dim); }
+    .step.done { color: var(--green); }
+    .step-num {
+      width: 20px; height: 20px;
+      border-radius: 50%;
+      background: var(--border);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 10px; flex-shrink: 0;
+    }
+    .step.active .step-num { background: var(--accent); color: white; }
+    .step.done .step-num { background: var(--green); color: white; }
+
+    /* ── Upload zone ─────────────────────────────────────────────── */
+    .upload-zone {
+      border: 2px dashed var(--border);
+      border-radius: var(--radius-lg);
+      padding: 60px 40px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s;
+      background: var(--surface);
+    }
+    .upload-zone:hover, .upload-zone.drag-over {
+      border-color: var(--accent);
+      background: var(--accent-dim);
+    }
+    .upload-icon { font-size: 48px; margin-bottom: 16px; display: block; }
+    .upload-title { font-size: 20px; font-weight: 600; margin-bottom: 8px; }
+    .upload-sub { color: var(--text-muted); margin-bottom: 24px; }
+    .upload-formats {
+      display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;
+    }
+    .fmt-badge {
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 3px 10px;
+      border-radius: 20px;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+    }
+
+    /* ── Form controls ───────────────────────────────────────────── */
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-top: 24px;
+    }
+    .form-group label {
+      display: block;
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+      font-family: var(--mono);
+    }
+    select, input[type="text"], input[type="number"] {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 12px;
+      border-radius: var(--radius);
+      font-family: var(--sans);
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    select:focus, input:focus { border-color: var(--accent); }
+    select option { background: var(--surface2); }
+
+    /* ── Buttons ─────────────────────────────────────────────────── */
+    .btn {
+      padding: 10px 20px;
+      border-radius: var(--radius);
+      border: none;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 600;
+      transition: all 0.15s;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: white;
+    }
+    .btn-primary:hover { background: #e06b55; }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-secondary {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-secondary:hover { border-color: var(--border-hi); }
+    .btn-green { background: var(--green); color: white; }
+    .btn-green:hover { background: #30a040; }
+
+    /* ── Processing screen ───────────────────────────────────────── */
+    .pipeline-status {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 32px;
+    }
+    .progress-bar-wrap {
+      background: var(--surface2);
+      border-radius: 4px;
+      height: 6px;
+      margin: 16px 0;
+      overflow: hidden;
+    }
+    .progress-bar {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 4px;
+      transition: width 0.4s ease;
+    }
+    .progress-bar.done { background: var(--green); }
+    .stage-label {
+      font-family: var(--mono);
+      font-size: 13px;
+      color: var(--accent);
+      margin-bottom: 4px;
+    }
+    .logs {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 16px;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--text-muted);
+      max-height: 180px;
+      overflow-y: auto;
+      margin-top: 16px;
+    }
+    .log-line { padding: 2px 0; }
+    .log-line.new { color: var(--text); }
+    .spinner {
+      display: inline-block;
+      width: 16px; height: 16px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Resource grid ───────────────────────────────────────────── */
+    .resource-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .resource-card {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px;
+      font-size: 12px;
+    }
+    .resource-type {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--accent);
+      margin-bottom: 4px;
+      word-break: break-all;
+    }
+    .resource-label { color: var(--text); font-weight: 500; }
+    .resource-conf {
+      margin-top: 6px;
+      height: 3px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .resource-conf-fill {
+      height: 100%;
+      border-radius: 2px;
+    }
+
+    /* ── Resource review (Clarify screen, Phase B) ───────────────── */
+    .review-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+      gap: 10px;
+    }
+    .review-card {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px;
+      font-size: 12px;
+      transition: opacity 0.15s, border-color 0.15s;
+    }
+    .review-card.deleted {
+      opacity: 0.45;
+      border-color: var(--accent);
+    }
+    .review-card-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .review-conf-badge {
+      font-family: var(--mono);
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 10px;
+      white-space: nowrap;
+    }
+    .review-card input[type="text"] {
+      width: 100%;
+      font-size: 12px;
+      padding: 6px 8px;
+      margin-bottom: 6px;
+      background: var(--surface);
+    }
+    .review-card input[type="text"].label-input { font-weight: 500; }
+    .review-card input[type="text"].type-input {
+      font-family: var(--mono);
+      color: var(--accent);
+      font-size: 11px;
+    }
+    .review-delete-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      border-radius: var(--radius);
+      font-size: 11px;
+      padding: 3px 8px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .review-delete-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .review-card.deleted .review-delete-btn { border-color: var(--green); color: var(--green); }
+    .review-card.deleted input { text-decoration: line-through; }
+
+    /* ── Clarification screen ────────────────────────────────────── */
+    .clarify-header {
+      background: var(--yellow-dim);
+      border: 1px solid var(--yellow);
+      border-radius: var(--radius);
+      padding: 16px;
+      margin-bottom: 24px;
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+    }
+    .clarify-sections {}
+    .clarify-group {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .clarify-group-label {
+      font-size: 12px;
+      font-family: var(--mono);
+      color: var(--text-muted);
+      margin-bottom: 14px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .clarify-field { margin-bottom: 16px; }
+    .clarify-field:last-child { margin-bottom: 0; }
+    .clarify-question {
+      font-size: 13px;
+      color: var(--text);
+      margin-bottom: 6px;
+    }
+
+    /* ── Review / Code viewer ────────────────────────────────────── */
+    .review-layout {
+      display: grid;
+      grid-template-columns: 220px 1fr;
+      gap: 20px;
+      min-height: 500px;
+    }
+    .file-tree {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .file-tree-header {
+      padding: 10px 14px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border);
+      background: var(--surface2);
+    }
+    .file-item {
+      padding: 7px 14px;
+      font-family: var(--mono);
+      font-size: 12px;
+      cursor: pointer;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border);
+      transition: background 0.1s;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .file-item:hover { background: var(--surface2); color: var(--text); }
+    .file-item.active { background: var(--accent-dim); color: var(--accent); }
+    .file-item.is-dir { color: var(--blue); font-weight: 600; cursor: default; }
+    .file-item.is-dir:hover { background: transparent; }
+    .code-viewer {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .code-header {
+      padding: 10px 16px;
+      background: var(--surface2);
+      border-bottom: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--text-muted);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    pre {
+      padding: 16px;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.7;
+      overflow: auto;
+      flex: 1;
+      max-height: 520px;
+      color: var(--text);
+    }
+    .code-editor {
+      padding: 16px;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.7;
+      overflow: auto;
+      flex: 1;
+      min-height: 200px;
+      max-height: 520px;
+      color: var(--text);
+      background: var(--surface);
+      border: none;
+      outline: none;
+      resize: vertical;
+      white-space: pre;
+      width: 100%;
+      box-sizing: border-box;
+    }
+
+    /* TF syntax highlight */
+    .kw { color: var(--purple); }
+    .str { color: var(--green); }
+    .cmt { color: var(--text-dim); font-style: italic; }
+    .ref { color: var(--blue); }
+    .attr { color: #79c0ff; }
+
+    /* ── Validation badges ───────────────────────────────────────── */
+    .val-summary {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .val-badge {
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+    .val-pass  { background: var(--green-dim);  color: var(--green); }
+    .val-warn  { background: var(--yellow-dim); color: var(--yellow); }
+    .val-fail  { background: var(--accent-dim); color: var(--accent); }
+    .val-checks {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      margin-bottom: 20px;
+    }
+    .val-check-row {
+      display: grid;
+      grid-template-columns: 24px 140px auto;
+      gap: 12px;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      align-items: center;
+    }
+    .val-check-row:last-child { border-bottom: none; }
+    .val-check-name { font-family: var(--mono); color: var(--text-muted); }
+    .val-check-msg { color: var(--text); }
+
+    /* ── Section headers ─────────────────────────────────────────── */
+    .section-title {
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+    .section-sub {
+      color: var(--text-muted);
+      font-size: 13px;
+      margin-bottom: 24px;
+    }
+
+    /* ── Cards ───────────────────────────────────────────────────── */
+    .info-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .info-card-title {
+      font-size: 12px;
+      font-family: var(--mono);
+      color: var(--text-muted);
+      margin-bottom: 8px;
+    }
+    .stat-row {
+      display: flex;
+      gap: 24px;
+      margin-bottom: 20px;
+    }
+    .stat { text-align: center; }
+    .stat-val { font-size: 28px; font-weight: 700; font-family: var(--mono); color: var(--accent); }
+    .stat-key { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+
+    .download-cta {
+      background: linear-gradient(135deg, var(--green-dim), var(--blue-dim));
+      border: 1px solid var(--green);
+      border-radius: var(--radius-lg);
+      padding: 32px;
+      text-align: center;
+      margin-top: 24px;
+    }
+    .download-cta h2 { font-size: 22px; margin-bottom: 8px; }
+    .download-cta p { color: var(--text-muted); margin-bottom: 20px; }
+
+    .actions { display: flex; gap: 12px; margin-top: 20px; }
+
+    .error-box {
+      background: var(--accent-dim);
+      border: 1px solid var(--accent);
+      border-radius: var(--radius);
+      padding: 16px;
+      margin-top: 16px;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--accent);
+    }
+
+    /* ── Module chips ────────────────────────────────────────────── */
+    .module-chips {
+      display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px;
+    }
+    .module-chip {
+      padding: 4px 12px;
+      background: var(--blue-dim);
+      border: 1px solid var(--blue);
+      border-radius: 20px;
+      font-size: 11px;
+      font-family: var(--mono);
+      color: var(--blue);
+    }
+  </style>
+</head>
+<body>
+
+<header class="header">
+  <div class="logo">arch<span>2</span>terraform</div>
+  <div class="header-badge">v0.1.0 — AWS</div>
+</header>
+
+<main>
+
+  <!-- ── Step indicator ── -->
+  <div class="steps">
+    <div class="step active" id="step-upload">
+      <div class="step-num">1</div> Upload Diagram
+    </div>
+    <div class="step" id="step-process">
+      <div class="step-num">2</div> Processing
+    </div>
+    <div class="step" id="step-clarify">
+      <div class="step-num">3</div> Clarify
+    </div>
+    <div class="step" id="step-review">
+      <div class="step-num">4</div> Review &amp; Download
+    </div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════
+       SCREEN 1 — Upload
+  ═════════════════════════════════════════════════════════════ -->
+  <div class="screen active" id="screen-upload">
+    <div class="section-title">Upload Architecture Diagram</div>
+    <div class="section-sub">
+      Drop your architecture diagram and get production-ready Terraform modules in minutes.
+    </div>
+
+    <div class="upload-zone" id="upload-zone">
+      <span class="upload-icon">📐</span>
+      <div class="upload-title">Drop your diagram here</div>
+      <div class="upload-sub">or click to browse files</div>
+      <div class="upload-formats">
+        <span class="fmt-badge">.drawio</span>
+        <span class="fmt-badge">.excalidraw</span>
+        <span class="fmt-badge">.svg (Lucidchart)</span>
+        <span class="fmt-badge">.png / .jpg</span>
+      </div>
+      <input type="file" id="file-input" accept=".drawio,.xml,.svg,.excalidraw,.json,.png,.jpg,.jpeg,.webp" style="display:none" />
+    </div>
+
+    <div id="file-selected" style="display:none;margin-top:12px;padding:10px 14px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);font-family:var(--mono);font-size:12px;color:var(--green);">
+      ✓ <span id="file-name"></span>
+    </div>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label>AWS Region</label>
+        <select id="aws-region">
+          <option value="us-east-1">us-east-1 (N. Virginia)</option>
+          <option value="us-west-2">us-west-2 (Oregon)</option>
+          <option value="eu-west-1">eu-west-1 (Ireland)</option>
+          <option value="eu-central-1">eu-central-1 (Frankfurt)</option>
+          <option value="ap-southeast-1">ap-southeast-1 (Singapore)</option>
+          <option value="ap-northeast-1">ap-northeast-1 (Tokyo)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Environment</label>
+        <select id="environment">
+          <option value="dev">dev</option>
+          <option value="staging">staging</option>
+          <option value="prod">prod</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="form-group" style="margin-top:4px;">
+      <label>Existing terraform.tfstate <span style="color:var(--text-dim);font-weight:400;">(optional — reconciling against a real, already-deployed environment? Attach its state file and matched resources will be generated with their REAL current values instead of catalog defaults. A brand-new environment/project needs nothing here.)</span></label>
+      <div class="upload-zone" id="state-upload-zone" style="padding:14px;min-height:auto;">
+        <span style="font-size:12px;color:var(--text-muted);">Click to attach a terraform.tfstate, or skip for a new environment</span>
+        <input type="file" id="state-file-input" accept=".tfstate,.json" style="display:none" />
+      </div>
+      <div id="state-file-selected" style="display:none;margin-top:8px;padding:8px 14px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);font-family:var(--mono);font-size:12px;color:var(--green);">
+        ✓ <span id="state-file-name"></span>
+        <button type="button" onclick="clearStateFile()" style="background:none;border:none;color:var(--text-dim);cursor:pointer;float:right;font-family:var(--mono);">✕ remove</button>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="btn btn-primary" id="btn-upload" disabled onclick="startUpload()">
+        Generate Terraform →
+      </button>
+    </div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════
+       SCREEN 2 — Processing
+  ═════════════════════════════════════════════════════════════ -->
+  <div class="screen" id="screen-process">
+    <div class="section-title">Processing your diagram</div>
+    <div class="section-sub">The pipeline is running — this takes 15–60 seconds.</div>
+
+    <div class="pipeline-status">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <div class="spinner" id="proc-spinner"></div>
+        <div class="stage-label" id="proc-stage">Initialising...</div>
+      </div>
+      <div class="progress-bar-wrap">
+        <div class="progress-bar" id="progress-bar" style="width:5%"></div>
+      </div>
+      <div style="text-align:right;font-family:var(--mono);font-size:11px;color:var(--text-dim)" id="progress-pct">5%</div>
+
+      <!-- Detected resources (shown after parsing) -->
+      <div id="resource-preview" style="display:none;">
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;margin-top:16px;">
+          Detected resources
+        </div>
+        <div class="resource-grid" id="resource-grid"></div>
+      </div>
+
+      <div class="logs" id="proc-logs">
+        <div class="log-line">Waiting for pipeline...</div>
+      </div>
+    </div>
+
+    <div class="error-box" id="proc-error" style="display:none;"></div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════
+       SCREEN 3 — Clarification
+  ═════════════════════════════════════════════════════════════ -->
+  <div class="screen" id="screen-clarify">
+    <div class="section-title">A few questions</div>
+    <div class="section-sub">
+      Some values couldn't be inferred from your diagram. Fill these in to generate accurate Terraform.
+    </div>
+
+    <div class="clarify-header" style="margin-bottom:20px;">
+      <span style="font-size:20px">📄</span>
+      <div style="flex:1;">
+        <div style="font-weight:600;margin-bottom:4px;">Reusing a previous vars.yaml?</div>
+        <div style="color:var(--text-muted);font-size:12px;margin-bottom:10px;">
+          Re-running against an updated version of a diagram you've already configured? Attach the
+          <code style="font-family:var(--mono)">vars.yaml</code> from that run's downloaded ZIP — every field it
+          covers gets pre-filled below (still editable) so you're only really answering what's new or changed.
+        </div>
+        <div class="upload-zone" id="vars-upload-zone" style="padding:14px;min-height:auto;">
+          <span style="font-size:12px;color:var(--text-muted);">Click to attach a vars.yaml, or skip and fill everything in below</span>
+          <input type="file" id="vars-file-input" accept=".yaml,.yml" style="display:none" />
+        </div>
+        <div id="vars-file-status" style="display:none;margin-top:8px;padding:8px 14px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);font-family:var(--mono);font-size:12px;"></div>
+      </div>
+    </div>
+
+    <div class="clarify-header" id="review-header">
+      <span style="font-size:20px">🔍</span>
+      <div>
+        <div style="font-weight:600;margin-bottom:4px;">Review detected resources</div>
+        <div style="color:var(--text-muted);font-size:12px;">
+          Image-based diagrams are parsed with computer vision and OCR, which can't guarantee perfect
+          detection — check the list below and fix or remove anything that's wrong before continuing.
+          Structured diagrams (.drawio / .excalidraw) are parsed exactly and rarely need changes here.
+        </div>
+      </div>
+    </div>
+
+    <div class="review-grid" id="review-grid" style="margin-bottom:28px;">
+      <!-- Populated by JS -->
+    </div>
+
+    <div class="clarify-header">
+      <span style="font-size:20px">⚡</span>
+      <div>
+        <div style="font-weight:600;margin-bottom:4px;">Clarification needed</div>
+        <div style="color:var(--text-muted);font-size:12px;">
+          These values are required to produce valid infrastructure code.
+          Defaults are pre-filled where possible.
+        </div>
+      </div>
+    </div>
+
+    <div class="clarify-sections" id="clarify-sections">
+      <!-- Populated by JS -->
+    </div>
+
+    <div class="actions">
+      <button class="btn btn-primary" onclick="submitClarification()">Continue →</button>
+    </div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════
+       SCREEN 4 — Review & Download
+  ═════════════════════════════════════════════════════════════ -->
+  <div class="screen" id="screen-review">
+    <div class="section-title">Terraform modules ready</div>
+    <div class="section-sub">Review the generated code, check validation results, then download.</div>
+
+    <!-- Stats -->
+    <div class="stat-row" id="review-stats"></div>
+
+    <!-- Validation -->
+    <div id="validation-section" style="display:none">
+      <div style="font-size:15px;font-weight:600;margin-bottom:12px;">Validation</div>
+      <div class="val-summary" id="val-summary"></div>
+      <div class="val-checks" id="val-checks"></div>
+    </div>
+
+    <!-- Terraform Plan Output (raw sandbox `terraform plan` output — only
+         present when SANDBOX_ENABLED=true + real AWS credentials are set;
+         backend already captures this in validation_result.terraform_plan_output,
+         and the full untruncated text was always set here via .textContent
+         — the ONLY thing that was ever capped at 80 chars is the one-line
+         summary in the check row above this, a different field entirely.
+         Shown expanded by default now (was collapsed behind a "Show"
+         click) so the complete output is actually in view for review
+         without an extra step; the toggle button still lets you collapse
+         it back if it's in the way. -->
+    <div id="plan-output-section" style="display:none;margin-bottom:20px;">
+      <div style="font-size:15px;font-weight:600;margin-bottom:10px;display:flex;align-items:center;gap:10px;">
+        Terraform Plan Output
+        <button class="btn btn-secondary" style="padding:4px 10px;font-size:11px" onclick="togglePlanOutput()" id="plan-output-toggle">Hide</button>
+      </div>
+      <pre id="plan-output-content" style="display:block;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;font-family:var(--mono);font-size:12px;line-height:1.6;color:var(--text);max-height:640px;overflow:auto;"></pre>
+    </div>
+
+    <!-- Module chips -->
+    <div style="font-size:15px;font-weight:600;margin-bottom:10px;">Modules Generated</div>
+    <div class="module-chips" id="module-chips"></div>
+
+    <!-- Code viewer -->
+    <div style="font-size:15px;font-weight:600;margin:20px 0 12px;">Code Preview</div>
+    <div class="review-layout">
+      <div class="file-tree">
+        <div class="file-tree-header">📁 terraform/</div>
+        <div id="file-list"></div>
+      </div>
+      <div class="code-viewer">
+        <div class="code-header">
+          <span id="active-file-name">Select a file</span>
+          <div style="display:flex;gap:6px;">
+            <button class="btn btn-secondary" style="padding:4px 10px;font-size:11px" onclick="copyFile()" id="btn-copy-file">Copy</button>
+            <button class="btn btn-secondary" style="padding:4px 10px;font-size:11px" onclick="toggleEditFile()" id="btn-edit-file">✎ Edit</button>
+            <button class="btn btn-green" style="padding:4px 10px;font-size:11px;display:none;" onclick="saveEditedFile()" id="btn-save-file">Save</button>
+            <button class="btn btn-secondary" style="padding:4px 10px;font-size:11px;display:none;" onclick="cancelEditFile()" id="btn-cancel-file">Cancel</button>
+          </div>
+        </div>
+        <pre id="code-content"><span style="color:var(--text-dim)">← Select a file to preview</span></pre>
+        <textarea id="code-editor" class="code-editor" style="display:none;" spellcheck="false"></textarea>
+        <div id="edit-save-status" style="display:none;padding:6px 16px;font-family:var(--mono);font-size:11px;border-top:1px solid var(--border);"></div>
+      </div>
+    </div>
+
+    <!-- Download CTA -->
+    <div class="download-cta">
+      <h2>🎉 Infrastructure code is ready</h2>
+      <p>Download the ZIP and run <code style="font-family:var(--mono);color:var(--green)">terraform init && terraform plan</code> to get started.</p>
+      <button class="btn btn-green" style="font-size:16px;padding:14px 32px" onclick="downloadZip()">
+        ⬇ Download terraform.zip
+      </button>
+    </div>
+
+    <!-- Push to GitHub -->
+    <div class="info-card" style="margin-top:20px;">
+      <div class="info-card-title">Push to GitHub</div>
+      <div style="color:var(--text-muted);font-size:12px;margin-bottom:14px;">
+        Pushes into an <strong>existing</strong> repo you specify — commits the generated Terraform
+        (under <code style="font-family:var(--mono)">terraform/&lt;environment&gt;/</code>) and the source diagram itself
+        (under <code style="font-family:var(--mono)">diagrams/&lt;environment&gt;/</code>) on a new branch, then opens a
+        Pull Request against that repo's default branch. Environment comes from what you picked on the upload
+        screen, so dev/staging/prod never collide. Only those paths are touched — everything
+        else already in the repo is left alone. Your token is sent for this request only — it is never saved.
+      </div>
+      <div class="form-row" style="grid-template-columns:1fr 1fr;margin-top:0;">
+        <div class="form-group">
+          <label>GitHub Personal Access Token</label>
+          <input type="password" id="github-token" placeholder="ghp_..." autocomplete="off" />
+        </div>
+        <div class="form-group">
+          <label>Repository (owner/repo)</label>
+          <input type="text" id="github-repo-full-name" placeholder="yourname/infra-repo" />
+        </div>
+      </div>
+      <div class="actions" style="margin-top:14px;">
+        <button class="btn btn-primary" id="btn-push-github" onclick="pushToGithub()">Push to GitHub</button>
+      </div>
+      <div id="github-push-result" style="display:none;margin-top:14px;"></div>
+    </div>
+
+    <!-- Apply to Sandbox -->
+    <div class="info-card" style="margin-top:20px;">
+      <div class="info-card-title">Apply to Sandbox</div>
+
+      <div class="clarify-header" style="margin-bottom:14px;">
+        <span style="font-size:20px">⚠️</span>
+        <div>
+          <div style="font-weight:600;margin-bottom:4px;">This creates real, billable AWS resources</div>
+          <div style="color:var(--text-muted);font-size:12px;">
+            Runs <code style="font-family:var(--mono)">terraform init/plan/apply</code> on this backend's own
+            machine, using whatever AWS credentials are already active there (e.g. your local
+            <code style="font-family:var(--mono)">~/.aws/credentials</code> [default] profile) — nothing is sent
+            through this browser. Review the plan output carefully before confirming. Applied resources are
+            <strong>auto-destroyed after 2 hours</strong> unless you destroy them sooner, so nothing is left
+            running by accident.
+          </div>
+        </div>
+      </div>
+
+      <div class="actions" style="margin-top:0;">
+        <button class="btn btn-primary" id="btn-apply-plan" onclick="runApplyPlan()">Run terraform plan</button>
+        <button class="btn btn-secondary" id="btn-apply-drift" onclick="runApplyDrift()">Check drift</button>
+        <button class="btn btn-green" id="btn-apply-confirm" style="display:none;" onclick="runApplyConfirm()">✓ Confirm &amp; Apply</button>
+        <button class="btn btn-secondary" id="btn-apply-destroy" style="display:none;" onclick="runApplyDestroy()">Destroy now</button>
+      </div>
+
+      <div id="apply-status-badge" style="display:none;margin-top:12px;font-size:12px;color:var(--text-muted);"></div>
+
+      <div id="apply-drift-section" style="display:none;margin-top:14px;"></div>
+
+      <div id="apply-blocked-section" style="display:none;margin-top:14px;">
+        <div class="error-box" style="margin-top:0;margin-bottom:14px;">
+          ✗ These variables still hold placeholder values from the generator and need a real value
+          before this can be applied to your AWS account. Fill them in below.
+        </div>
+        <div id="apply-blocked-fields"></div>
+        <div class="actions" style="margin-top:14px;">
+          <button class="btn btn-primary" id="btn-apply-resolve" onclick="submitBlockedVariables()">Save &amp; Retry Plan</button>
+        </div>
+      </div>
+
+      <div id="apply-plan-section" style="display:none;margin-top:14px;">
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;">Plan output</div>
+        <pre id="apply-plan-output" class="logs" style="max-height:280px;overflow:auto;"></pre>
+      </div>
+
+      <div id="apply-log-section" style="display:none;margin-top:14px;">
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;">Apply log</div>
+        <div id="apply-log" class="logs" style="max-height:200px;overflow:auto;"></div>
+      </div>
+
+      <div id="apply-result-box" style="display:none;margin-top:14px;"></div>
+    </div>
+
+    <div class="actions">
+      <button class="btn btn-secondary" onclick="startOver()">← Start over</button>
+    </div>
+  </div>
+
+</main>
+
+<!-- Client-side YAML parsing for the optional vars.yaml pre-fill on the
+     Clarify screen (see applyVarsYamlPrefill()) — the ONLY external
+     dependency this page has; everything else is vanilla JS on purpose. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js"></script>
+
+<script>
+/* ══════════════════════════════════════════════════════════
+   State
+══════════════════════════════════════════════════════════ */
+// Empty string = same-origin relative requests ("/api/v1/..."), which is
+// what works once nginx reverse-proxies /api/ to the backend container on
+// whatever host/IP/domain this is actually deployed to (EC2 public IP, a
+// real domain, or nginx-fronted localhost — all identical, no CORS
+// involved since browser + API share one origin). The one exception is
+// opening this file directly via file:// (the original local-dev flow,
+// before nginx was ever in the picture) — there's no server at all in
+// that case, so it still needs the absolute localhost:8000 backend URL.
+// Set window.ARCH2TF_API_BASE before this script runs to override either way.
+const API = window.ARCH2TF_API_BASE
+  || (location.protocol === 'file:' ? 'http://localhost:8000' : '');
+let state = {
+  jobId: null,
+  pollInterval: null,
+  file: null,
+  stateFile: null,   // optional existing terraform.tfstate, reconciled against real values before planning
+  previewFiles: {},
+  activeFile: null,
+  clarifyFields: [],
+  reviewResources: [],   // detected resources shown on the Clarify screen for review
+  reviewDeleted: new Set(),  // resource ids the user marked for deletion
+
+  // "Apply to Sandbox" — confirmToken is held only long enough to send the
+  // confirm request; applyPollInterval polls apply/status while
+  // applying/destroying are in flight so the log/countdown stay live.
+  applyStatus: 'not_started',
+  confirmToken: null,
+  applyPollInterval: null,
+};
+
+/* ══════════════════════════════════════════════════════════
+   Screen management
+══════════════════════════════════════════════════════════ */
+function showScreen(name) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById('screen-' + name).classList.add('active');
+  const steps = ['upload', 'process', 'clarify', 'review'];
+  const idx = steps.indexOf(name === 'process' ? 'process' : name);
+  document.querySelectorAll('.step').forEach((s, i) => {
+    s.classList.remove('active', 'done');
+    if (i < idx) s.classList.add('done');
+    else if (i === idx) s.classList.add('active');
+  });
+}
+
+/* ══════════════════════════════════════════════════════════
+   Upload screen
+══════════════════════════════════════════════════════════ */
+const uploadZone = document.getElementById('upload-zone');
+const fileInput  = document.getElementById('file-input');
+
+uploadZone.addEventListener('click', () => fileInput.click());
+uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
+uploadZone.addEventListener('drop', e => {
+  e.preventDefault();
+  uploadZone.classList.remove('drag-over');
+  const file = e.dataTransfer.files[0];
+  if (file) handleFileSelect(file);
+});
+fileInput.addEventListener('change', () => {
+  if (fileInput.files[0]) handleFileSelect(fileInput.files[0]);
+});
+
+function handleFileSelect(file) {
+  state.file = file;
+  document.getElementById('file-selected').style.display = 'block';
+  document.getElementById('file-name').textContent = `${file.name} (${(file.size/1024).toFixed(1)} KB)`;
+  document.getElementById('btn-upload').disabled = false;
+}
+
+/* ── Optional existing terraform.tfstate ─────────────────────────────────
+   Unlike vars.yaml (moved to the Clarify screen — pure client-side
+   pre-fill, no backend involvement until submit), this one HAS to travel
+   with the initial upload: state_reconciler.reconcile_from_state() runs
+   server-side right after parsing, before clarification even begins, so
+   there's no later point in the flow where attaching it would still work. */
+const stateUploadZone = document.getElementById('state-upload-zone');
+const stateFileInput  = document.getElementById('state-file-input');
+
+stateUploadZone.addEventListener('click', () => stateFileInput.click());
+stateFileInput.addEventListener('change', () => {
+  if (stateFileInput.files[0]) handleStateFileSelect(stateFileInput.files[0]);
+});
+
+function handleStateFileSelect(file) {
+  state.stateFile = file;
+  document.getElementById('state-file-selected').style.display = 'block';
+  document.getElementById('state-file-name').textContent = `${file.name} (${(file.size/1024).toFixed(1)} KB)`;
+}
+
+function clearStateFile() {
+  state.stateFile = null;
+  stateFileInput.value = '';
+  document.getElementById('state-file-selected').style.display = 'none';
+}
+
+async function startUpload() {
+  if (!state.file) return;
+
+  const formData = new FormData();
+  formData.append('file', state.file);
+  formData.append('aws_region', document.getElementById('aws-region').value);
+  formData.append('environment', document.getElementById('environment').value);
+  if (state.stateFile) {
+    formData.append('state_file', state.stateFile);
+  }
+
+  showScreen('process');
+  updateProcessStage('Uploading diagram...', 5);
+
+  try {
+    const resp = await fetch(`${API}/api/v1/upload`, { method: 'POST', body: formData });
+    if (!resp.ok) {
+      const err = await resp.json();
+      showProcessError(err.detail || 'Upload failed');
+      return;
+    }
+    const data = await resp.json();
+    state.jobId = data.job_id;
+    startPolling();
+  } catch (e) {
+    showProcessError(`Cannot connect to backend at ${API}. Is the FastAPI server running?`);
+  }
+}
+
+/* ══════════════════════════════════════════════════════════
+   Processing / Polling
+══════════════════════════════════════════════════════════ */
+function startPolling() {
+  if (state.pollInterval) clearInterval(state.pollInterval);
+  state.pollInterval = setInterval(pollStatus, 2000);
+  pollStatus();
+}
+
+async function pollStatus() {
+  if (!state.jobId) return;
+  try {
+    const resp = await fetch(`${API}/api/v1/jobs/${state.jobId}`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    handleStatusUpdate(data);
+  } catch (e) {
+    // Backend temporarily unreachable — keep polling
+  }
+}
+
+function handleStatusUpdate(data) {
+  updateProcessStage(data.current_stage, data.progress_percent);
+  updateLogs(data.stage_logs || []);
+
+  if (data.parsed_diagram && data.parsed_diagram.resources.length > 0) {
+    showResourcePreview(data.parsed_diagram.resources);
+  }
+
+  if (data.status === 'needs_clarification') {
+    clearInterval(state.pollInterval);
+    showClarifyScreen(data.clarification_request, data.parsed_diagram);
+    return;
+  }
+
+  if (data.status === 'done') {
+    clearInterval(state.pollInterval);
+    document.getElementById('progress-bar').classList.add('done');
+    updateProcessStage('Complete!', 100);
+    setTimeout(() => showReviewScreen(data), 600);
+    return;
+  }
+
+  if (data.status === 'failed') {
+    clearInterval(state.pollInterval);
+    document.getElementById('proc-spinner').style.display = 'none';
+    showProcessError(data.error_message || 'Pipeline failed');
+    return;
+  }
+}
+
+function updateProcessStage(label, pct) {
+  document.getElementById('proc-stage').textContent = label;
+  document.getElementById('progress-bar').style.width = pct + '%';
+  document.getElementById('progress-pct').textContent = pct + '%';
+}
+
+function updateLogs(logs) {
+  const el = document.getElementById('proc-logs');
+  el.innerHTML = logs.map((l, i) =>
+    `<div class="log-line ${i === logs.length-1 ? 'new' : ''}">${escHtml(l)}</div>`
+  ).join('');
+  el.scrollTop = el.scrollHeight;
+}
+
+function showResourcePreview(resources) {
+  const wrap = document.getElementById('resource-preview');
+  const grid = document.getElementById('resource-grid');
+  wrap.style.display = 'block';
+  grid.innerHTML = resources.map(r => {
+    const conf = Math.round((r.confidence || 1) * 100);
+    const color = conf >= 80 ? 'var(--green)' : conf >= 60 ? 'var(--yellow)' : 'var(--accent)';
+    return `<div class="resource-card">
+      <div class="resource-type">${escHtml(r.aws_resource_type)}</div>
+      <div class="resource-label">${escHtml(r.label || r.logical_name)}</div>
+      <div class="resource-conf">
+        <div class="resource-conf-fill" style="width:${conf}%;background:${color}"></div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function showProcessError(msg) {
+  const el = document.getElementById('proc-error');
+  el.style.display = 'block';
+  el.textContent = '✗ ' + msg;
+}
+
+/* ══════════════════════════════════════════════════════════
+   Clarification screen
+══════════════════════════════════════════════════════════ */
+function showClarifyScreen(clarReq, parsedDiagram) {
+  showScreen('clarify');
+  state.clarifyFields = clarReq.fields;
+  state.reviewResources = (parsedDiagram && parsedDiagram.resources) || [];
+  state.reviewDeleted = new Set();
+
+  renderReviewGrid();
+  renderClarifySections();
+
+  // Fresh job — the vars.yaml attach box resets each time this screen is
+  // (re)shown, same as file-input on the old upload-screen version did.
+  varsFileInput.value = '';
+  document.getElementById('vars-file-status').style.display = 'none';
+}
+
+/**
+ * Renders the "Clarification needed" fields below the resource-review
+ * grid — pulled out of showClarifyScreen() and made independently
+ * callable (2026-07-29, her explicit request) so removing a resource up
+ * in the review grid immediately hides that resource's own questions down
+ * here too, instead of only silently dropping them at submit time
+ * (submitClarification() already skipped deleted resources' answers —
+ * this just makes the FORM catch up to match what actually gets sent).
+ *
+ * Re-rendering naively from each field's `.default` would wipe out
+ * anything already typed (or pre-filled from an attached vars.yaml) in
+ * whatever fields are still visible — so current values are snapshotted
+ * before rebuilding the DOM and restored onto the same field ids after.
+ */
+function renderClarifySections() {
+  const savedValues = {};
+  for (const f of state.clarifyFields) {
+    const el = document.getElementById(`field_${f.resource_id}_${f.field_key}`);
+    if (el) savedValues[el.id] = el.value;
+  }
+
+  const visibleFields = state.clarifyFields.filter(f => !state.reviewDeleted.has(f.resource_id));
+
+  const groups = {};
+  for (const f of visibleFields) {
+    const key = f.resource_label || f.resource_id;
+    if (!groups[key]) groups[key] = { label: key, fields: [] };
+    groups[key].fields.push(f);
+  }
+
+  const container = document.getElementById('clarify-sections');
+
+  if (visibleFields.length === 0) {
+    container.innerHTML = state.clarifyFields.length
+      ? `<div style="color:var(--text-dim);font-size:13px;padding:4px 0 12px;">No remaining questions — every resource that needed one was removed above.</div>`
+      : '';
+    return;
+  }
+
+  container.innerHTML = Object.values(groups).map(group => `
+    <div class="clarify-group">
+      <div class="clarify-group-label">
+        ${group.label === 'Global settings' ? '⚙️ ' : '🔧 '}${escHtml(group.label)}
+      </div>
+      ${group.fields.map(f => renderClarifyField(f)).join('')}
+    </div>
+  `).join('');
+
+  for (const f of visibleFields) {
+    const id = `field_${f.resource_id}_${f.field_key}`;
+    if (id in savedValues) {
+      const el = document.getElementById(id);
+      if (el) el.value = savedValues[id];
+    }
+  }
+}
+
+/* ══════════════════════════════════════════════════════════
+   Optional vars.yaml pre-fill (moved here from the upload screen per her
+   explicit request — re-running against an updated diagram version should
+   let you see the just-rendered clarification form get filled in, not
+   attach the file blind before you've even seen what's being asked).
+   Parsed entirely client-side (js-yaml, loaded via CDN above) — this is
+   purely a browser-side convenience layer on top of the SAME clarification
+   fields the backend already built; nothing about detect_missing_info()'s
+   server-side logic changes, so every field stays visible and editable
+   even when pre-filled, rather than silently disappearing the way the
+   backend's own vars_file upload path (still available via POST /upload
+   for programmatic/CI use) suppresses already-covered questions entirely.
+══════════════════════════════════════════════════════════ */
+const varsUploadZone = document.getElementById('vars-upload-zone');
+const varsFileInput  = document.getElementById('vars-file-input');
+
+varsUploadZone.addEventListener('click', () => varsFileInput.click());
+varsFileInput.addEventListener('change', () => {
+  if (varsFileInput.files[0]) handleVarsYamlFile(varsFileInput.files[0]);
+});
+
+function setVarsFileStatus(message, isError) {
+  const el = document.getElementById('vars-file-status');
+  el.style.display = 'block';
+  el.style.color = isError ? 'var(--accent)' : 'var(--green)';
+  el.textContent = message;
+}
+
+async function handleVarsYamlFile(file) {
+  let text;
+  try {
+    text = await file.text();
+  } catch (e) {
+    setVarsFileStatus(`✗ Could not read ${file.name}: ${e.message}`, true);
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = jsyaml.load(text);
+  } catch (e) {
+    setVarsFileStatus(`✗ ${file.name} is not valid YAML: ${e.message}`, true);
+    return;
+  }
+
+  if (!parsed || typeof parsed !== 'object') {
+    setVarsFileStatus(`✗ ${file.name} doesn't look like a vars.yaml (empty or not a mapping)`, true);
+    return;
+  }
+
+  const { filled, total } = applyVarsYamlPrefill(parsed);
+  setVarsFileStatus(
+    `✓ ${file.name} — pre-filled ${filled} of ${total} field(s) below. Review before continuing.`,
+    false
+  );
+}
+
+/** Matches vars.yaml's "<aws_resource_type>.<logical_name>" resource keys
+ * (see missing_info_detector.py's _resource_key()) against the currently
+ * rendered clarification fields, and fills in every input whose value it
+ * covers — global fields (aws_region/environment/project_name) match
+ * directly on field_key against vars.yaml's "globals" section. */
+function applyVarsYamlPrefill(parsed) {
+  const globals = parsed.globals || {};
+  const resources = parsed.resources || {};
+
+  const resourceIdToKey = {};
+  for (const r of state.reviewResources) {
+    resourceIdToKey[r.id] = `${r.aws_resource_type}.${r.logical_name}`;
+  }
+
+  let filled = 0;
+  for (const f of state.clarifyFields) {
+    const el = document.getElementById(`field_${f.resource_id}_${f.field_key}`);
+    if (!el) continue;
+
+    let value;
+    if (f.resource_id === 'target_global') {
+      value = globals[f.field_key];
+    } else {
+      const key = resourceIdToKey[f.resource_id];
+      const covered = key ? resources[key] : null;
+      value = covered ? covered[f.field_key] : undefined;
+    }
+
+    if (value !== undefined && value !== null && String(value) !== '') {
+      el.value = String(value);
+      el.style.borderColor = 'var(--green)';
+      filled++;
+    }
+  }
+  return { filled, total: state.clarifyFields.length };
+}
+
+/* ══════════════════════════════════════════════════════════
+   Resource review (Phase B) — shown above the clarify questions.
+   Image-parsed diagrams can produce wrong/duplicate/garbled resources
+   that still carry a high confidence score (OCR fallback labels and
+   phantom detections aren't reliably "low confidence" — see
+   layout_detector.py / image_adapter.py fixes), so this review has to
+   cover every resource, not just ones below the reclassify threshold.
+══════════════════════════════════════════════════════════ */
+function renderReviewGrid() {
+  const grid = document.getElementById('review-grid');
+  const header = document.getElementById('review-header');
+
+  if (!state.reviewResources.length) {
+    grid.innerHTML = '';
+    header.style.display = 'none';
+    return;
+  }
+  header.style.display = 'flex';
+
+  // Rebuilding the whole grid (every toggleReviewDelete call rebuilds every
+  // card, not just the one clicked) would otherwise silently wipe out any
+  // label/type edits already typed into OTHER cards — snapshot current
+  // input values first and restore them after, same pattern used for the
+  // clarify fields below.
+  const savedValues = {};
+  document.querySelectorAll('#review-grid input[data-review]').forEach(el => {
+    savedValues[`${el.dataset.review}:${el.dataset.field}`] = el.value;
+  });
+
+  grid.innerHTML = state.reviewResources.map(r => {
+    const conf = Math.round((r.confidence ?? 1) * 100);
+    const color = conf >= 80 ? 'var(--green)' : conf >= 60 ? 'var(--yellow)' : 'var(--accent)';
+    const bg = conf >= 80 ? 'var(--green-dim)' : conf >= 60 ? 'var(--yellow-dim)' : 'var(--accent-dim)';
+    const isDeleted = state.reviewDeleted.has(r.id);
+    const labelVal = savedValues[`${r.id}:label`] ?? (r.label || r.logical_name || '');
+    const typeVal = savedValues[`${r.id}:type`] ?? (r.aws_resource_type || '');
+    return `<div class="review-card ${isDeleted ? 'deleted' : ''}" id="review-card-${escAttr(r.id)}">
+      <div class="review-card-top">
+        <span class="review-conf-badge" style="color:${color};background:${bg}">${conf}% confident</span>
+        <button type="button" class="review-delete-btn" onclick="toggleReviewDelete('${escAttr(r.id)}')">
+          ${isDeleted ? '↺ Restore' : '✕ Remove'}
+        </button>
+      </div>
+      <input type="text" class="label-input" data-review="${escAttr(r.id)}" data-field="label"
+        value="${escAttr(labelVal)}" ${isDeleted ? 'disabled' : ''} />
+      <input type="text" class="type-input" data-review="${escAttr(r.id)}" data-field="type"
+        value="${escAttr(typeVal)}" ${isDeleted ? 'disabled' : ''} />
+    </div>`;
+  }).join('');
+}
+
+function toggleReviewDelete(resourceId) {
+  if (state.reviewDeleted.has(resourceId)) {
+    state.reviewDeleted.delete(resourceId);
+  } else {
+    state.reviewDeleted.add(resourceId);
+  }
+  renderReviewGrid();
+  renderClarifySections();
+}
+
+/** Diff the review grid's current input values against the original
+ * detected resources to build the resource_corrections payload. Only
+ * actual changes are sent — untouched fields don't count as a "correction". */
+function collectResourceCorrections() {
+  const deletedIds = Array.from(state.reviewDeleted);
+  const relabeled = {};
+  const retyped = {};
+
+  for (const r of state.reviewResources) {
+    if (state.reviewDeleted.has(r.id)) continue;
+    const labelEl = document.querySelector(`input[data-review="${cssEscape(r.id)}"][data-field="label"]`);
+    const typeEl  = document.querySelector(`input[data-review="${cssEscape(r.id)}"][data-field="type"]`);
+    if (labelEl && labelEl.value.trim() && labelEl.value.trim() !== (r.label || '')) {
+      relabeled[r.id] = labelEl.value.trim();
+    }
+    if (typeEl && typeEl.value.trim() && typeEl.value.trim() !== (r.aws_resource_type || '')) {
+      retyped[r.id] = typeEl.value.trim();
+    }
+  }
+
+  return { deleted_ids: deletedIds, relabeled, retyped };
+}
+
+function escAttr(s) {
+  return String(s).replace(/"/g, '&quot;');
+}
+
+function cssEscape(s) {
+  return String(s).replace(/[^a-zA-Z0-9_-]/g, c => '\\' + c);
+}
+
+function renderClarifyField(f) {
+  const id = `field_${f.resource_id}_${f.field_key}`;
+  let input;
+
+  if (f.input_type === 'select' && f.options.length > 0) {
+    input = `<select id="${id}" data-resource="${f.resource_id}" data-key="${f.field_key}">
+      ${f.options.map(o => `<option value="${o}" ${o === f.default ? 'selected' : ''}>${o}</option>`).join('')}
+    </select>`;
+  } else if (f.input_type === 'number') {
+    input = `<input type="number" id="${id}" value="${f.default || ''}"
+      data-resource="${f.resource_id}" data-key="${f.field_key}" />`;
+  } else {
+    input = `<input type="text" id="${id}" value="${f.default || ''}"
+      placeholder="${f.required ? 'Required' : 'Optional'}"
+      data-resource="${f.resource_id}" data-key="${f.field_key}" />`;
+  }
+
+  return `<div class="clarify-field">
+    <div class="clarify-question">${escHtml(f.question)}</div>
+    ${input}
+  </div>`;
+}
+
+async function submitClarification() {
+  const resourceCorrections = collectResourceCorrections();
+  const deletedIds = new Set(resourceCorrections.deleted_ids);
+
+  const answers = [];
+  for (const f of state.clarifyFields) {
+    if (deletedIds.has(f.resource_id)) continue;  // don't ask about resources just removed
+    const id = `field_${f.resource_id}_${f.field_key}`;
+    const el = document.getElementById(id);
+    if (el) {
+      answers.push({
+        field_key: f.field_key,
+        resource_id: f.resource_id,
+        value: el.value,
+      });
+    }
+  }
+
+  showScreen('process');
+  updateProcessStage('Submitting answers and resuming pipeline...', 35);
+
+  try {
+    const resp = await fetch(`${API}/api/v1/jobs/${state.jobId}/clarify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: state.jobId, answers, resource_corrections: resourceCorrections }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json();
+      showProcessError(err.detail || 'Clarification failed');
+      return;
+    }
+    startPolling();
+  } catch (e) {
+    showProcessError('Could not submit answers: ' + e.message);
+  }
+}
+
+/* ══════════════════════════════════════════════════════════
+   Review screen
+══════════════════════════════════════════════════════════ */
+async function showReviewScreen(statusData) {
+  showScreen('review');
+
+  // Reset state left over from a previous job in the same browser session —
+  // without this, running a second job that has no plan output (or whose
+  // GitHub push wasn't retried) would keep showing the FIRST job's plan
+  // output / push result, since those elements are only ever set to
+  // 'block'/populated further down, never explicitly cleared for a fresh job.
+  document.getElementById('plan-output-section').style.display = 'none';
+  document.getElementById('plan-output-content').textContent = '';
+  document.getElementById('plan-output-content').style.display = 'block';
+  document.getElementById('plan-output-toggle').textContent = 'Hide';
+  document.getElementById('github-push-result').style.display = 'none';
+  document.getElementById('github-push-result').innerHTML = '';
+  document.getElementById('github-token').value = '';
+  // Deliberately NOT clearing github-repo-full-name: the whole point of
+  // this feature is pushing successive diagram versions to the SAME
+  // existing repo, so keeping it filled in across jobs in one browser
+  // session is the common case, not an oversight. The token still gets
+  // cleared every time since it's a live credential.
+
+  // Stats
+  const parsed = statusData.parsed_diagram;
+  if (parsed) {
+    document.getElementById('review-stats').innerHTML = `
+      <div class="stat"><div class="stat-val">${parsed.total_resources}</div><div class="stat-key">Resources</div></div>
+      <div class="stat"><div class="stat-val">${parsed.total_connections}</div><div class="stat-key">Connections</div></div>
+      <div class="stat"><div class="stat-val">${Object.keys(parsed.resource_type_summary || {}).length}</div><div class="stat-key">Resource Types</div></div>
+    `;
+  }
+
+  // Validation
+  const val = statusData.validation_result;
+  if (val) {
+    document.getElementById('validation-section').style.display = 'block';
+    const overall = val.overall_status;
+    const icon = { passed: '✅', warning: '⚠️', failed: '❌' }[overall] || 'ℹ️';
+    document.getElementById('val-summary').innerHTML = `
+      <div class="val-badge val-pass">✅ ${val.passed_count} passed</div>
+      <div class="val-badge val-warn">⚠️ ${val.warning_count} warnings</div>
+      <div class="val-badge val-fail">❌ ${val.failed_count} errors</div>
+    `;
+    document.getElementById('val-checks').innerHTML = (val.checks || []).map(c => {
+      const icon = { passed: '✅', warning: '⚠️', failed: '❌' }[c.status] || 'ℹ️';
+      return `<div class="val-check-row">
+        <span>${icon}</span>
+        <span class="val-check-name">${escHtml(c.tool)}</span>
+        <span class="val-check-msg">${escHtml((c.message || '').substring(0, 80))}</span>
+      </div>`;
+    }).join('');
+
+    // Full raw `terraform plan` output — only present when sandbox validation
+    // actually ran (SANDBOX_ENABLED=true + real AWS creds). The check row
+    // above only shows an 80-char-truncated one-liner, which isn't enough to
+    // actually review what a real plan against your AWS account would do.
+    if (val.terraform_plan_output && val.terraform_plan_output.trim()) {
+      document.getElementById('plan-output-section').style.display = 'block';
+      document.getElementById('plan-output-content').textContent = val.terraform_plan_output;
+    }
+  }
+
+  // Load file preview
+  try {
+    const resp = await fetch(`${API}/api/v1/jobs/${state.jobId}/preview`);
+    if (resp.ok) {
+      const data = await resp.json();
+      state.previewFiles = data.files || {};
+
+      // Module chips
+      document.getElementById('module-chips').innerHTML = (data.modules || []).map(m =>
+        `<div class="module-chip">📦 ${m.name} <span style="opacity:0.6">(${m.file_count} files)</span></div>`
+      ).join('');
+
+      // File tree
+      buildFileTree(data.files);
+    }
+  } catch (e) {
+    // Preview not critical
+  }
+}
+
+function buildFileTree(files) {
+  const list = document.getElementById('file-list');
+  const keys = Object.keys(files).sort();
+
+  let lastDir = null;
+  let html = '';
+
+  for (const key of keys) {
+    const parts = key.split('/');
+    if (parts.length > 1) {
+      const dir = parts.slice(0, -1).join('/');
+      if (dir !== lastDir) {
+        html += `<div class="file-item is-dir">📁 ${escHtml(dir)}/</div>`;
+        lastDir = dir;
+      }
+      html += `<div class="file-item" data-key="${escHtml(key)}" onclick="selectFile('${key}')" style="padding-left:24px">
+        ${escHtml(parts[parts.length - 1])}
+      </div>`;
+    } else {
+      lastDir = null;
+      html += `<div class="file-item" data-key="${escHtml(key)}" onclick="selectFile('${key}')">${escHtml(key)}</div>`;
+    }
+  }
+  list.innerHTML = html;
+
+  // Auto-select main.tf
+  const first = keys.find(k => k === 'main.tf') || keys[0];
+  if (first) selectFile(first);
+}
+
+function selectFile(key) {
+  // Match on the full path via data-key, not the displayed basename — every
+  // module (and the root) has its own main.tf/variables.tf/outputs.tf/
+  // versions.tf, so matching by displayed text (as this used to do) highlit
+  // every same-named file across every module at once instead of just the
+  // one that was clicked.
+  document.querySelectorAll('.file-item').forEach(el => {
+    el.classList.toggle('active', el.dataset.key === key);
+  });
+
+  state.activeFile = key;
+  document.getElementById('active-file-name').textContent = key;
+  const content = state.previewFiles[key] || '';
+  document.getElementById('code-content').innerHTML = highlightTF(content);
+
+  // Switching files while mid-edit discards the in-progress (unsaved) edit —
+  // simplest, least-surprising behavior rather than silently carrying edits
+  // across files or blocking navigation.
+  cancelEditFile();
+}
+
+/* ══════════════════════════════════════════════════════════
+   Edit mode for the generated-code preview (2026-07-29, her explicit
+   request). Whole-file replacement, saved via PUT /jobs/{id}/files/{key} —
+   see pipeline.py's edit_file() for the exact key convention (must match
+   what /preview already returned, "modules/<name>/<file>" or a bare root
+   filename or "README.md").
+══════════════════════════════════════════════════════════ */
+function toggleEditFile() {
+  if (!state.activeFile) return;
+  document.getElementById('code-content').style.display = 'none';
+  const editor = document.getElementById('code-editor');
+  editor.value = state.previewFiles[state.activeFile] || '';
+  editor.style.display = 'block';
+  editor.focus();
+  document.getElementById('btn-edit-file').style.display = 'none';
+  document.getElementById('btn-copy-file').style.display = 'none';
+  document.getElementById('btn-save-file').style.display = 'inline-flex';
+  document.getElementById('btn-cancel-file').style.display = 'inline-flex';
+  document.getElementById('edit-save-status').style.display = 'none';
+}
+
+function cancelEditFile() {
+  document.getElementById('code-editor').style.display = 'none';
+  document.getElementById('code-content').style.display = 'block';
+  document.getElementById('btn-edit-file').style.display = 'inline-flex';
+  document.getElementById('btn-copy-file').style.display = 'inline-flex';
+  document.getElementById('btn-save-file').style.display = 'none';
+  document.getElementById('btn-cancel-file').style.display = 'none';
+}
+
+async function saveEditedFile() {
+  const key = state.activeFile;
+  if (!key) return;
+  const newContent = document.getElementById('code-editor').value;
+  const btn = document.getElementById('btn-save-file');
+  const statusEl = document.getElementById('edit-save-status');
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = 'Saving…';
+
+  try {
+    // file_key can contain "/" (module files) — the backend route uses a
+    // {file_key:path} converter expecting the literal slashes, so this is
+    // NOT url-encoded the way a single path segment normally would be.
+    const resp = await fetch(`${API}/api/v1/jobs/${state.jobId}/files/${key}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: newContent }),
+    });
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      statusEl.style.display = 'block';
+      statusEl.style.color = 'var(--accent)';
+      statusEl.textContent = `✗ ${data.detail || 'Failed to save'}`;
+      return;
+    }
+
+    state.previewFiles[key] = newContent;
+    document.getElementById('code-content').innerHTML = highlightTF(newContent);
+    cancelEditFile();
+    statusEl.style.display = 'block';
+    statusEl.style.color = 'var(--yellow)';
+    statusEl.textContent = `✓ ${data.message}`;
+  } catch (e) {
+    statusEl.style.display = 'block';
+    statusEl.style.color = 'var(--accent)';
+    statusEl.textContent = `✗ Could not reach backend: ${e.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  }
+}
+
+function togglePlanOutput() {
+  const content = document.getElementById('plan-output-content');
+  const btn = document.getElementById('plan-output-toggle');
+  const isHidden = content.style.display === 'none';
+  content.style.display = isHidden ? 'block' : 'none';
+  btn.textContent = isHidden ? 'Hide' : 'Show';
+}
+
+function copyFile() {
+  const content = state.previewFiles[state.activeFile] || '';
+  navigator.clipboard.writeText(content).then(() => {
+    const btn = document.getElementById('btn-copy-file');
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = 'Copy', 1500);
+  });
+}
+
+async function downloadZip() {
+  window.location.href = `${API}/api/v1/jobs/${state.jobId}/download`;
+}
+
+async function pushToGithub() {
+  const tokenInput = document.getElementById('github-token');
+  const repoInput = document.getElementById('github-repo-full-name');
+  const btn = document.getElementById('btn-push-github');
+  const resultBox = document.getElementById('github-push-result');
+
+  const token = tokenInput.value.trim();
+  const repoFullName = repoInput.value.trim();
+
+  if (!token) {
+    resultBox.style.display = 'block';
+    resultBox.innerHTML = `<div class="error-box" style="margin-top:0;">✗ Enter a GitHub personal access token first.</div>`;
+    return;
+  }
+  if (!repoFullName || !repoFullName.includes('/')) {
+    resultBox.style.display = 'block';
+    resultBox.innerHTML = `<div class="error-box" style="margin-top:0;">✗ Enter the target repository as "owner/repo" (e.g. yourname/infra-repo).</div>`;
+    return;
+  }
+
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = 'Pushing...';
+  resultBox.style.display = 'none';
+
+  try {
+    const resp = await fetch(`${API}/api/v1/jobs/${state.jobId}/push-to-github`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        github_token: token,
+        repo_full_name: repoFullName,
+      }),
+    });
+    const data = await resp.json();
+    resultBox.style.display = 'block';
+
+    if (!resp.ok) {
+      resultBox.innerHTML = `<div class="error-box" style="margin-top:0;">✗ ${escHtml(data.detail || 'Push failed')}</div>`;
+      return;
+    }
+
+    resultBox.innerHTML = `
+      <div style="background:var(--green-dim);border:1px solid var(--green);border-radius:var(--radius);padding:14px;">
+        <div style="color:var(--green);font-weight:600;margin-bottom:8px;">✅ Pushed successfully (${escHtml(data.environment)})</div>
+        <div style="font-size:12px;line-height:2;">
+          Repo: <a href="${data.repo_url}" target="_blank" style="color:var(--blue);">${escHtml(data.repo_full_name)}</a><br/>
+          Pull Request: <a href="${data.pr_url}" target="_blank" style="color:var(--blue);">${escHtml(data.pr_url)}</a><br/>
+          Paths: <code style="font-family:var(--mono);color:var(--text-muted);">terraform/${escHtml(data.environment)}/</code> and
+          <code style="font-family:var(--mono);color:var(--text-muted);">diagrams/${escHtml(data.environment)}/</code>
+        </div>
+      </div>`;
+
+    // Token was only ever needed for this one request — clear it immediately
+    // rather than leaving a real credential sitting in a form field.
+    tokenInput.value = '';
+  } catch (e) {
+    resultBox.style.display = 'block';
+    resultBox.innerHTML = `<div class="error-box" style="margin-top:0;">✗ Could not reach backend: ${escHtml(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  }
+}
+
+/* ══════════════════════════════════════════════════════════
+   Apply to Sandbox
+══════════════════════════════════════════════════════════ */
+const APPLY_STATUS_LABEL = {
+  not_started: 'Not started', planning: 'Running terraform plan…',
+  awaiting_confirm: 'Plan ready — review below, then confirm',
+  applying: 'Applying to AWS…', applied: 'Applied — live in your AWS account',
+  destroying: 'Destroying…', destroyed: 'Destroyed', failed: 'Failed',
+};
+
+function setApplyButtons(status) {
+  document.getElementById('btn-apply-plan').style.display = ['awaiting_confirm', 'applying', 'destroying'].includes(status) ? 'none' : 'inline-flex';
+  document.getElementById('btn-apply-confirm').style.display = status === 'awaiting_confirm' ? 'inline-flex' : 'none';
+  document.getElementById('btn-apply-destroy').style.display = ['applied', 'failed'].includes(status) ? 'inline-flex' : 'none';
+}
+
+function renderApplyBadge(data) {
+  const badge = document.getElementById('apply-status-badge');
+  badge.style.display = 'block';
+  let extra = '';
+  if (data.destroy_in_seconds != null && data.destroy_in_seconds > 0) {
+    const mins = Math.floor(data.destroy_in_seconds / 60);
+    extra = ` — auto-destroy in ~${mins} min unless you destroy sooner`;
+  }
+  badge.innerHTML = `Status: <strong>${escHtml(APPLY_STATUS_LABEL[data.apply_status] || data.apply_status)}</strong>${escHtml(extra)}`;
+
+  const logSection = document.getElementById('apply-log-section');
+  const logBox = document.getElementById('apply-log');
+  if (data.apply_log && data.apply_log.length) {
+    logSection.style.display = 'block';
+    logBox.innerHTML = data.apply_log.map(l => `<div class="log-line">${escHtml(l)}</div>`).join('');
+    logBox.scrollTop = logBox.scrollHeight;
+  }
+
+  const resultBox = document.getElementById('apply-result-box');
+  if (data.apply_status === 'failed' && data.apply_error) {
+    resultBox.style.display = 'block';
+    resultBox.innerHTML = `<div class="error-box" style="margin-top:0;">✗ ${escHtml(data.apply_error)}</div>`;
+  } else if (data.apply_status === 'applied') {
+    resultBox.style.display = 'block';
+    resultBox.innerHTML = `<div style="background:var(--green-dim);border:1px solid var(--green);border-radius:var(--radius);padding:14px;color:var(--green);font-weight:600;">✅ Applied successfully — remember to destroy when you're done, or it will auto-destroy in ~2 hours.</div>`;
+  } else if (data.apply_status === 'destroyed') {
+    resultBox.style.display = 'block';
+    resultBox.innerHTML = `<div style="background:var(--green-dim);border:1px solid var(--green);border-radius:var(--radius);padding:14px;color:var(--green);font-weight:600;">✅ Destroyed — no sandbox resources left running.</div>`;
+  } else {
+    resultBox.style.display = 'none';
+  }
+
+  setApplyButtons(data.apply_status);
+  state.applyStatus = data.apply_status;
+}
+
+function startApplyPolling() {
+  clearInterval(state.applyPollInterval);
+  state.applyPollInterval = setInterval(async () => {
+    try {
+      const resp = await fetch(`${API}/api/v1/jobs/${state.jobId}/apply/status`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      renderApplyBadge(data);
+      if (!['planning', 'applying', 'destroying'].includes(data.apply_status)) {
+        clearInterval(state.applyPollInterval);
+      }
+    } catch (e) { /* transient — next tick will retry */ }
+  }, 2000);
+}
+
+function renderBlockedVariablesForm(blockedVars) {
+  const section = document.getElementById('apply-blocked-section');
+  const fieldsBox = document.getElementById('apply-blocked-fields');
+
+  if (!blockedVars || !blockedVars.length) {
+    section.style.display = 'none';
+    fieldsBox.innerHTML = '';
+    return;
+  }
+
+  section.style.display = 'block';
+  fieldsBox.innerHTML = blockedVars.map(v => `
+    <div class="form-group" style="margin-bottom:12px;">
+      <label>${escHtml(v.description || v.variable_name)} <span style="color:var(--text-dim);font-weight:400;">(${escHtml(v.file)})</span></label>
+      <input type="text" data-blocked-id="${escAttr(v.id)}" placeholder="currently: ${escAttr(v.current_value)}" />
+    </div>
+  `).join('');
+}
+
+async function submitBlockedVariables() {
+  const inputs = document.querySelectorAll('#apply-blocked-fields input[data-blocked-id]');
+  const overrides = {};
+  inputs.forEach(input => {
+    const val = input.value.trim();
+    if (val) overrides[input.dataset.blockedId] = val;
+  });
+
+  if (Object.keys(overrides).length === 0) {
+    alert('Fill in at least one value before retrying.');
+    return;
+  }
+
+  const btn = document.getElementById('btn-apply-resolve');
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = 'Saving & retrying…';
+
+  try {
+    const resp = await fetch(`${API}/api/v1/jobs/${state.jobId}/apply/resolve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ overrides }),
+    });
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      document.getElementById('apply-result-box').style.display = 'block';
+      document.getElementById('apply-result-box').innerHTML = `<div class="error-box" style="margin-top:0;">✗ ${escHtml(data.detail || 'Failed to save values')}</div>`;
+      return;
+    }
+
+    handleApplyPlanResponse(data);
+  } catch (e) {
+    document.getElementById('apply-result-box').style.display = 'block';
+    document.getElementById('apply-result-box').innerHTML = `<div class="error-box" style="margin-top:0;">✗ Could not reach backend: ${escHtml(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  }
+}
+
+function handleApplyPlanResponse(data) {
+  // Still missing one or more real values — render inputs for exactly
+  // what's left (partial fixes from an earlier round are already gone
+  // from this list, since the backend only reports what's STILL blocked).
+  if (data.blocked_variables && data.blocked_variables.length) {
+    renderBlockedVariablesForm(data.blocked_variables);
+    document.getElementById('apply-plan-section').style.display = 'none';
+    document.getElementById('apply-status-badge').style.display = 'none';
+    setApplyButtons('not_started');
+    state.confirmToken = null;
+    return;
+  }
+
+  renderBlockedVariablesForm([]);
+  state.confirmToken = data.confirm_token;
+  document.getElementById('apply-plan-section').style.display = 'block';
+  document.getElementById('apply-plan-output').textContent = data.plan_output || '(no output)';
+  document.getElementById('apply-status-badge').style.display = 'block';
+  document.getElementById('apply-status-badge').innerHTML = `Status: <strong>${escHtml(APPLY_STATUS_LABEL[data.apply_status] || data.apply_status)}</strong> — token expires in 15 min`;
+  setApplyButtons(data.apply_status);
+  state.applyStatus = data.apply_status;
+}
+
+async function runApplyPlan() {
+  const btn = document.getElementById('btn-apply-plan');
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = 'Running plan…';
+  document.getElementById('apply-result-box').style.display = 'none';
+
+  try {
+    const resp = await fetch(`${API}/api/v1/jobs/${state.jobId}/apply/plan`, { method: 'POST' });
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      document.getElementById('apply-result-box').style.display = 'block';
+      document.getElementById('apply-result-box').innerHTML = `<div class="error-box" style="margin-top:0;">✗ ${escHtml(data.detail || 'Plan failed')}</div>`;
+      return;
+    }
+
+    handleApplyPlanResponse(data);
+  } catch (e) {
+    document.getElementById('apply-result-box').style.display = 'block';
+    document.getElementById('apply-result-box').innerHTML = `<div class="error-box" style="margin-top:0;">✗ Could not reach backend: ${escHtml(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  }
+}
+
+const DRIFT_STATUS_LABEL = {
+  unknown: 'Not checked yet', checking: 'Checking…',
+  clean: 'No drift — real infra matches last-known state',
+  drift_detected: 'Drift detected', failed: 'Drift check failed',
+};
+
+function renderDriftResult(data) {
+  const section = document.getElementById('apply-drift-section');
+  section.style.display = 'block';
+
+  if (data.drift_status === 'clean') {
+    section.innerHTML = `<div style="background:var(--green-dim);border:1px solid var(--green);border-radius:var(--radius);padding:14px;color:var(--green);font-weight:600;">✅ ${escHtml(DRIFT_STATUS_LABEL.clean)}</div>`;
+    return;
+  }
+
+  if (data.drift_status === 'drift_detected') {
+    const list = (data.drift_resources || []).map(r => `<li>${escHtml(r)}</li>`).join('');
+    section.innerHTML = `
+      <div class="error-box" style="margin-top:0;margin-bottom:10px;">
+        ⚠️ Drift detected — real AWS resources have changed outside Terraform since the last apply.
+      </div>
+      ${list ? `<ul style="margin:0 0 10px 18px;font-size:13px;">${list}</ul>` : ''}
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;">Refresh-only plan output</div>
+      <pre class="logs" style="max-height:280px;overflow:auto;">${escHtml(data.drift_output || '(no output)')}</pre>
+    `;
+    return;
+  }
+
+  if (data.drift_status === 'failed') {
+    section.innerHTML = `<div class="error-box" style="margin-top:0;">✗ Drift check failed:<pre class="logs" style="max-height:200px;overflow:auto;margin-top:8px;">${escHtml(data.drift_output || '')}</pre></div>`;
+    return;
+  }
+
+  section.style.display = 'none';
+}
+
+async function runApplyDrift() {
+  const btn = document.getElementById('btn-apply-drift');
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = 'Checking drift…';
+
+  try {
+    const resp = await fetch(`${API}/api/v1/jobs/${state.jobId}/apply/drift`, { method: 'POST' });
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      const section = document.getElementById('apply-drift-section');
+      section.style.display = 'block';
+      section.innerHTML = `<div class="error-box" style="margin-top:0;">✗ ${escHtml(data.detail || 'Drift check failed')}</div>`;
+      return;
+    }
+
+    renderDriftResult(data);
+  } catch (e) {
+    const section = document.getElementById('apply-drift-section');
+    section.style.display = 'block';
+    section.innerHTML = `<div class="error-box" style="margin-top:0;">✗ Could not reach backend: ${escHtml(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  }
+}
+
+async function runApplyConfirm() {
+  if (!state.confirmToken) {
+    alert('No plan token — run terraform plan again first.');
+    return;
+  }
+  if (!confirm('This will create real, billable resources in your AWS account. Continue?')) {
+    return;
+  }
+
+  const btn = document.getElementById('btn-apply-confirm');
+  btn.disabled = true;
+  btn.textContent = 'Applying…';
+  document.getElementById('apply-log-section').style.display = 'block';
+
+  try {
+    const resp = await fetch(`${API}/api/v1/jobs/${state.jobId}/apply/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm_token: state.confirmToken }),
+    });
+    const data = await resp.json();
+    state.confirmToken = null;
+
+    if (!resp.ok) {
+      document.getElementById('apply-result-box').style.display = 'block';
+      document.getElementById('apply-result-box').innerHTML = `<div class="error-box" style="margin-top:0;">✗ ${escHtml(data.detail || 'Apply failed')}</div>`;
+      setApplyButtons('failed');
+      return;
+    }
+
+    renderApplyBadge(data);
+    startApplyPolling();
+  } catch (e) {
+    document.getElementById('apply-result-box').style.display = 'block';
+    document.getElementById('apply-result-box').innerHTML = `<div class="error-box" style="margin-top:0;">✗ Could not reach backend: ${escHtml(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '✓ Confirm & Apply';
+  }
+}
+
+async function runApplyDestroy() {
+  if (!confirm('Destroy the sandbox resources this job applied?')) {
+    return;
+  }
+  const btn = document.getElementById('btn-apply-destroy');
+  btn.disabled = true;
+  btn.textContent = 'Destroying…';
+
+  try {
+    const resp = await fetch(`${API}/api/v1/jobs/${state.jobId}/apply/destroy`, { method: 'POST' });
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      document.getElementById('apply-result-box').style.display = 'block';
+      document.getElementById('apply-result-box').innerHTML = `<div class="error-box" style="margin-top:0;">✗ ${escHtml(data.detail || 'Destroy failed')}</div>`;
+      return;
+    }
+
+    renderApplyBadge(data);
+    startApplyPolling();
+  } catch (e) {
+    document.getElementById('apply-result-box').style.display = 'block';
+    document.getElementById('apply-result-box').innerHTML = `<div class="error-box" style="margin-top:0;">✗ Could not reach backend: ${escHtml(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Destroy now';
+  }
+}
+
+function startOver() {
+  clearInterval(state.pollInterval);
+  clearInterval(state.applyPollInterval);
+  state = { jobId: null, pollInterval: null, file: null, previewFiles: {}, activeFile: null, clarifyFields: [], reviewResources: [], reviewDeleted: new Set(), applyStatus: 'not_started', confirmToken: null, applyPollInterval: null };
+  document.getElementById('file-selected').style.display = 'none';
+  document.getElementById('btn-upload').disabled = true;
+  document.getElementById('proc-error').style.display = 'none';
+  document.getElementById('resource-preview').style.display = 'none';
+  document.getElementById('progress-bar').classList.remove('done');
+  fileInput.value = '';
+  showScreen('upload');
+}
+
+/* ══════════════════════════════════════════════════════════
+   Terraform syntax highlighter (lightweight)
+══════════════════════════════════════════════════════════ */
+function highlightTF(code) {
+  // Was 4 chained .replace() calls, each re-scanning the FULL string
+  // produced by the previous one — including the HTML those previous
+  // steps had just inserted. The last step, `\b([a-z_]+)\s*=`, matched the
+  // literal word "class" inside an already-inserted `<span class="kw">`
+  // attribute (since "class" is immediately followed by "="), wrapping it
+  // in another span and corrupting the tag into garbage like
+  // `class =class ="str">"kw">source = ...`. Confirmed broken 2026-07-08
+  // against real generated output (any line with "source", "type",
+  // "tags", "default" etc. — i.e. nearly every generated file) and visible
+  // directly in the Review screen's code preview.
+  //
+  // Fixed by doing ONE pass: a single regex with alternation finds
+  // comments/strings/keywords/attr-names against the ORIGINAL escaped
+  // text only, and the replacer callback decides which span to emit based
+  // on which alternative matched. Because each match is found once against
+  // the source text (never against text this function has already
+  // generated), there's nothing to re-scan and no way for HTML this
+  // function emits to be misinterpreted as more source code.
+  const KEYWORDS = 'resource|variable|output|locals|provider|module|terraform|required_providers|required_version|backend|data|source|default|description|type|value|for_each|depends_on|tags|merge';
+  const TOKEN = new RegExp(
+    '(#[^\\n]*)' +                        // 1: comment
+    '|("(?:[^"\\\\]|\\\\.)*")' +          // 2: string
+    '|\\b(' + KEYWORDS + ')\\b' +         // 3: keyword
+    '|\\b([a-z_][a-z0-9_]*)(\\s*=(?!=))', // 4: attr name, 5: its trailing " =" (not "==")
+    'g'
+  );
+
+  const h = escHtml(code);
+  return h.replace(TOKEN, (match, comment, str, kw, attrName, eq) => {
+    if (comment !== undefined) return `<span class="cmt">${comment}</span>`;
+    if (str !== undefined) {
+      const isRef = str.includes('aws_') || str.includes('var.') || str.includes('module.') || str.includes('local.');
+      return `<span class="${isRef ? 'ref' : 'str'}">${str}</span>`;
+    }
+    if (kw !== undefined) return `<span class="kw">${kw}</span>`;
+    if (attrName !== undefined) return `<span class="attr">${attrName}</span>${eq}`;
+    return match;
+  });
+}
+
+function escHtml(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+</script>
+</body>
+</html>

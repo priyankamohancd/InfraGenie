@@ -1,0 +1,89 @@
+# arch2terraform / arch2tf-product — deployment stack
+# -----------------------------------------------------
+# Lives at the "thesis/" root (not inside arch2tf-product/) because the
+# backend build needs BOTH sibling repos as its build context — see
+# arch2tf-product/backend/Dockerfile's module docstring for why.
+#
+# Services:
+#   redis  — job state store (missing_info_detector answers, pipeline
+#            progress, apply/drift status — see Job model in shared/schemas)
+#   api    — FastAPI backend (upload -> parse -> plan -> validate -> package,
+#            plus the real "Apply to Sandbox" terraform init/plan/apply/destroy)
+#   nginx  — serves the static frontend and reverse-proxies /api/ to `api`,
+#            so the browser only ever talks to ONE origin (this port 80) —
+#            no CORS configuration needed regardless of what public IP or
+#            domain ends up pointing at this box.
+#
+# Quick start (see the deployment runbook for the full EC2 walkthrough):
+#   cp arch2tf-product/backend/.env.example arch2tf-product/backend/.env
+#   # edit .env if needed — defaults work for a first run
+#   docker compose up -d --build
+#   # then open http://<this-host>/ in a browser
+#
+# AWS credentials for the real "Apply to Sandbox" terraform apply/destroy:
+# deliberately NOT configured here at all — apply_runner.py inherits
+# whatever's in the `api` container's own environment unchanged. On EC2,
+# attach an IAM instance role to the instance (see the runbook) and it just
+# works via the instance metadata service — no keys in this file, no keys
+# in .env, nothing to leak if this repo or a docker image ever gets shared.
+# If you're running this somewhere without an instance role available,
+# uncomment the aws_access_key_id/aws_secret_access_key lines in .env.example
+# instead (never commit that file with real values in it).
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: arch2tf-product/backend/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - arch2tf-product/backend/.env
+    environment:
+      # Overrides .env's REDIS_URL default (localhost) to point at the
+      # `redis` service on the compose network — kept here rather than in
+      # .env since it's a fact about THIS compose topology, not a value
+      # anyone deploying differently (bare metal, ECS, etc.) should copy.
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      # Persists uploaded diagrams, generated Terraform ZIPs, and — the
+      # important one — each job's apply_workdir (real terraform.tfstate
+      # for local-backend jobs, tfplan files, the confirm-token gate)
+      # across container restarts. Without this, restarting the `api`
+      # container mid-review would silently orphan anyone's in-progress
+      # Apply-to-Sandbox session.
+      - arch2tf_data:/tmp/arch2tf
+      # Terraform provider plugin cache — real speedup on every `terraform
+      # init` after the first (providers aren't re-downloaded per job).
+      - tf_plugin_cache:/root/.arch2tf/provider-cache
+    depends_on:
+      redis:
+        condition: service_healthy
+    expose:
+      - "8000"
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./arch2tf-product/frontend:/usr/share/nginx/html:ro
+      - ./arch2tf-product/infrastructure/docker/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - api
+
+volumes:
+  redis_data:
+  arch2tf_data:
+  tf_plugin_cache:

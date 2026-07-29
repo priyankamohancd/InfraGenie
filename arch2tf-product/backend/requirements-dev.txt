@@ -1,0 +1,11 @@
+# Test/dev-only dependencies — install with:
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+# Added 2026-07-08: pytest and anyio were required to run backend/tests/ but
+# weren't listed anywhere, so running the test suite meant discovering and
+# manually installing them first. httpx is already in requirements.txt
+# (used by app.services at runtime too) and is also what test_api.py's
+# AsyncClient needs, so it isn't repeated here.
+-r requirements.txt
+pytest==8.3.3
+anyio==4.6.0
