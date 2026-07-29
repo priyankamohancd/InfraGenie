@@ -9,6 +9,16 @@ attach the nearest unbound text element to a shape by containment/proximity.
 There's no AWS icon stencil system in Excalidraw, so resource hints come
 entirely from text labels — the classifier leans more heavily on label
 matching for diagrams from this adapter.
+
+Custom data (added 2026-07-08): Excalidraw elements natively support a
+`customData` object (used by apps built on Excalidraw to attach their own
+metadata to a shape without it appearing on the canvas) — read here the
+same way draw.io's "Edit Data" wrapper is read in drawio_adapter.py, into
+DiagramNode.tags. Only string-ish values are kept (matching
+DiagramNode.tags' `dict[str, str]` contract); non-string values are
+stringified rather than dropped, since `customData` is arbitrary JSON and
+this adapter shouldn't silently discard a tag just because someone stored
+a number or boolean.
 """
 
 from __future__ import annotations
@@ -69,6 +79,7 @@ class ExcalidrawAdapter(BaseAdapter):
                     fill_color=el.get("backgroundColor"),
                     parent_id=container_id,
                     source_format=self.format_name,
+                    tags=self._extract_custom_data(el),
                 )
             )
 
@@ -104,6 +115,12 @@ class ExcalidrawAdapter(BaseAdapter):
         )
 
     # -- internals -----------------------------------------------------
+
+    def _extract_custom_data(self, el: dict) -> dict[str, str]:
+        custom = el.get("customData")
+        if not isinstance(custom, dict):
+            return {}
+        return {str(k): (v if isinstance(v, str) else str(v)) for k, v in custom.items()}
 
     def _resolve_label(self, el: dict, text_elements: list[dict]) -> str:
         bound = el.get("boundElements") or []

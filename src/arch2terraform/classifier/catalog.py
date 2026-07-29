@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from arch2terraform.generator.hcl_format import Block
+
 
 @dataclass
 class ResourceDefinition:
@@ -27,6 +29,13 @@ class ResourceDefinition:
     label_keywords: tuple[str, ...]
     is_container: bool = False
     default_attributes: dict = field(default_factory=dict)
+    # Required nested HCL blocks (e.g. aws_eks_cluster's `vpc_config { ... }`)
+    # that hcl_format.py's resource_block() renders as real blocks (no `=`),
+    # distinct from default_attributes' flat/map-attribute values. Keyed by
+    # block name -> list of block bodies (a list because some block types can
+    # repeat, e.g. aws_codepipeline's `stage`). See hcl_format.Block for how
+    # to nest a block inside a block body.
+    nested_blocks: dict = field(default_factory=dict)
 
 
 # Placeholder ARNs — NOT just descriptive strings. A real `terraform validate`
@@ -40,6 +49,10 @@ class ResourceDefinition:
 # real AWS account will (correctly) fail until the user swaps in a real ARN.
 _FAKE_IAM_ROLE_ARN = "arn:aws:iam::000000000000:role/REPLACE_WITH_ROLE_NAME"
 _FAKE_S3_BUCKET_ARN = "arn:aws:s3:::replace-with-globally-unique-name"
+# Same ARN-format-validation story as the two above, caught by a real
+# `terraform validate` run (2026-07) against aws_batch_job_queue's
+# compute_environment_order.compute_environment nested-block argument.
+_FAKE_BATCH_COMPUTE_ENV_ARN = "arn:aws:batch:us-east-1:000000000000:compute-environment/REPLACE_WITH_COMPUTE_ENVIRONMENT_NAME"
 
 
 CATALOG: list[ResourceDefinition] = [
@@ -77,10 +90,55 @@ CATALOG: list[ResourceDefinition] = [
     # region- and architecture-specific) — a clearly-fake placeholder in the same
     # style as the S3 bucket name below lets `terraform validate` pass while still
     # forcing the user to supply a real one before `apply`.
+    # monitoring/ebs_optimized/metadata_options/root_block_device added
+    # 2026-07-24: checkov flagged every generated instance for CKV_AWS_126
+    # (detailed monitoring), CKV_AWS_135 (EBS-optimized), CKV_AWS_79
+    # (IMDSv2 — http_tokens defaults to "optional", i.e. IMDSv1 still
+    # reachable, a real SSRF-adjacent risk), and CKV_AWS_8 (encrypted root
+    # volume). All four have one unambiguous secure default with no
+    # required user input, unlike e.g. instance_type/ami which are genuine
+    # per-deployment choices — so these are safe to bake in rather than ask.
     ResourceDefinition("aws_instance", ("ec2",), ("ec2 instance", "ec2", "virtual machine"),
-                        default_attributes={"instance_type": "t3.micro", "ami": "ami-00000000000000000"}),
+                        default_attributes={
+                            "instance_type": "t3.micro",
+                            "ami": "ami-00000000000000000",
+                            "monitoring": True,
+                            "ebs_optimized": True,
+                        },
+                        nested_blocks={
+                            "metadata_options": [{
+                                "http_tokens": "required",
+                            }],
+                            "root_block_device": [{
+                                "encrypted": True,
+                            }],
+                        }),
     ResourceDefinition("aws_launch_template", ("launchtemplate",), ("launch template",)),
-    ResourceDefinition("aws_autoscaling_group", ("autoscaling",), ("auto scaling", "asg")),
+    # max_size/min_size are required flat arguments with no default. One of
+    # availability_zones/vpc_zone_identifier is also required (a cross-field "one
+    # of" constraint, same class of bug as aws_lb's subnets — not a simple
+    # per-argument Required flag, so it was previously missed). launch_template is
+    # a required *nested block* (or launch_configuration/mixed_instances_policy as
+    # alternatives) — now emitted via nested_blocks now that the generator supports
+    # real HCL blocks, not just flat attributes.
+    ResourceDefinition("aws_autoscaling_group", ("autoscaling",), ("auto scaling", "asg"),
+                        default_attributes={
+                            "max_size": 1,
+                            "min_size": 1,
+                            "vpc_zone_identifier": ["subnet-00000000000000000"],
+                        },
+                        nested_blocks={
+                            # A real `terraform validate` run (2026-07) caught that
+                            # launch_template.id is format-validated client-side —
+                            # it must look like a real launch template ID (`lt-`
+                            # prefix + alphanumeric), not a free-text placeholder;
+                            # a descriptive placeholder like the old
+                            # "REPLACE_WITH_LAUNCH_TEMPLATE_ID" fails validate outright.
+                            "launch_template": [{
+                                "id": "lt-00000000000000000",
+                                "version": "$Latest",
+                            }],
+                        }),
     # function_name, role, and a deployment package source (filename here) are all
     # required by the provider with no valid default — same placeholder philosophy.
     ResourceDefinition("aws_lambda_function", ("lambda",), ("lambda", "function"),
@@ -108,20 +166,35 @@ CATALOG: list[ResourceDefinition] = [
                                 '"cpu":128,"memory":256,"essential":true}]'
                             ),
                         }),
-    # role_arn is a required flat argument. vpc_config is ALSO required but is a nested
-    # HCL block (`vpc_config { subnet_ids = [...] }`), not a flat attribute — the
-    # generator currently only emits `key = value` attribute lines (see hcl_format.py),
-    # so this resource is emitted incomplete. Flagged in README's "Known limitations".
+    # role_arn is a required flat argument. vpc_config is ALSO required and is a nested
+    # HCL block (`vpc_config { subnet_ids = [...] }`), now emitted via nested_blocks.
+    # A real `terraform validate` run (2026-07) caught that `name` is also required
+    # with no default — the original per-argument audit only recorded role_arn for
+    # this type since it was already flagged block-incomplete and got less scrutiny.
     ResourceDefinition("aws_eks_cluster", ("eks", "elastickubernetes"), ("eks", "kubernetes"),
-                        default_attributes={"role_arn": _FAKE_IAM_ROLE_ARN}),
+                        default_attributes={
+                            "name": "replace-with-cluster-name",
+                            "role_arn": _FAKE_IAM_ROLE_ARN,
+                        },
+                        nested_blocks={
+                            "vpc_config": [{
+                                "subnet_ids": ["subnet-00000000000000000", "subnet-00000000000000001"],
+                            }],
+                        }),
     # name, state, priority are required flat arguments. compute_environment_order is
-    # ALSO required but is a nested block — same generator limitation as aws_eks_cluster
-    # above; this resource is emitted incomplete without it.
+    # ALSO required and is a nested block (at least one entry) — now emitted via
+    # nested_blocks.
     ResourceDefinition("aws_batch_job_queue", ("batch",), ("batch job", "batch queue"),
                         default_attributes={
                             "name": "replace-with-queue-name",
                             "state": "ENABLED",
                             "priority": 1,
+                        },
+                        nested_blocks={
+                            "compute_environment_order": [{
+                                "order": 1,
+                                "compute_environment": _FAKE_BATCH_COMPUTE_ENV_ARN,
+                            }],
                         }),
 
     # --- Storage -----------------------------------------------------------
@@ -157,13 +230,16 @@ CATALOG: list[ResourceDefinition] = [
     # name and hash_key are required flat arguments. PAY_PER_REQUEST billing mode is
     # used specifically to avoid also needing read_capacity/write_capacity (which are
     # conditionally required under the default PROVISIONED mode). The `attribute` block
-    # (declaring hash_key's type) is ALSO required but is a nested HCL block the
-    # generator can't emit yet — flagged in README's "Known limitations".
+    # (declaring hash_key's type — "S" for string, matching the "id" hash_key below) is
+    # ALSO required and is a nested HCL block, now emitted via nested_blocks.
     ResourceDefinition("aws_dynamodb_table", ("dynamodb",), ("dynamodb", "nosql"),
                         default_attributes={
                             "name": "replace-with-table-name",
                             "billing_mode": "PAY_PER_REQUEST",
                             "hash_key": "id",
+                        },
+                        nested_blocks={
+                            "attribute": [{"name": "id", "type": "S"}],
                         }),
     ResourceDefinition("aws_elasticache_cluster", ("elasticache",), ("elasticache", "redis", "memcached"),
                         default_attributes={
@@ -199,11 +275,44 @@ CATALOG: list[ResourceDefinition] = [
     # vpc_id is wired via containment like aws_subnet's vpc_id.
     ResourceDefinition("aws_lb_target_group", ("targetgroup",), ("target group",),
                         default_attributes={"port": 80, "protocol": "HTTP"}),
-    # Required blocks (origin, default_cache_behavior, restrictions, viewer_certificate)
-    # make this resource fundamentally incomplete without nested-block generator
-    # support — flagged in README's "Known limitations" rather than faked with flat
-    # attributes that wouldn't satisfy the schema anyway.
-    ResourceDefinition("aws_cloudfront_distribution", ("cloudfront",), ("cloudfront", "cdn")),
+    # Required blocks: origin (>=1), default_cache_behavior, restrictions, and
+    # viewer_certificate — now emitted via nested_blocks. default_cache_behavior
+    # itself needs a nested forwarded_values block (with a further-nested cookies
+    # block), and origin needs a nested custom_origin_config block (Block() marks
+    # these as blocks rather than map-typed attributes at each level). enabled is
+    # technically optional (defaults true) but set explicitly for clarity.
+    ResourceDefinition(
+        "aws_cloudfront_distribution", ("cloudfront",), ("cloudfront", "cdn"),
+        default_attributes={"enabled": True},
+        nested_blocks={
+            "origin": [{
+                "domain_name": "replace-with-origin-domain.example.com",
+                "origin_id": "primary-origin",
+                "custom_origin_config": Block({
+                    "http_port": 80,
+                    "https_port": 443,
+                    "origin_protocol_policy": "https-only",
+                    "origin_ssl_protocols": ["TLSv1.2"],
+                }),
+            }],
+            "default_cache_behavior": [{
+                "allowed_methods": ["GET", "HEAD"],
+                "cached_methods": ["GET", "HEAD"],
+                "target_origin_id": "primary-origin",
+                "viewer_protocol_policy": "redirect-to-https",
+                "forwarded_values": Block({
+                    "query_string": False,
+                    "cookies": Block({"forward": "none"}),
+                }),
+            }],
+            "restrictions": [{
+                "geo_restriction": Block({"restriction_type": "none"}),
+            }],
+            "viewer_certificate": [{
+                "cloudfront_default_certificate": True,
+            }],
+        },
+    ),
     # `name` (the domain) is required with no default; "example.com" is a
     # syntactically valid placeholder domain reserved for documentation use
     # (RFC 2606), so it passes validation without looking like a real zone.
@@ -220,14 +329,22 @@ CATALOG: list[ResourceDefinition] = [
     ResourceDefinition("aws_kinesis_stream", ("kinesis",), ("kinesis", "stream"),
                         default_attributes={"name": "replace-with-stream-name", "shard_count": 1}),
     # broker_name/engine_type/engine_version/host_instance_type are required flat
-    # arguments. `user` is ALSO required but is a nested block (at least one, with
-    # username/password) — same generator limitation noted elsewhere, flagged in README.
+    # arguments. `user` is ALSO required and is a nested block (at least one, with
+    # username/password) — now emitted via nested_blocks. AmazonMQ enforces a
+    # >=12-character password, so the placeholder is deliberately long enough to
+    # pass that client-side check rather than fail validate on password length.
     ResourceDefinition("aws_mq_broker", ("mq", "amazonmq"), ("amazon mq", "message broker"),
                         default_attributes={
                             "broker_name": "replace-with-broker-name",
                             "engine_type": "ActiveMQ",
                             "engine_version": "5.17.6",
                             "host_instance_type": "mq.t3.micro",
+                        },
+                        nested_blocks={
+                            "user": [{
+                                "username": "replace-with-username",
+                                "password": "REPLACE_WITH_STRONG_PASSWORD_12CHARS",
+                            }],
                         }),
     # Real Terraform AWS provider resource type is aws_cloudwatch_event_rule — there is
     # no "aws_eventbridge_rule" resource type in the provider (EventBridge is the AWS
@@ -247,14 +364,21 @@ CATALOG: list[ResourceDefinition] = [
                             "authentication_type": "API_KEY",
                         }),
     # name, execution_role_arn, source_bucket_arn, dag_s3_path are all required flat
-    # arguments. network_configuration is ALSO required but is a nested block — same
-    # generator limitation noted elsewhere, flagged in README's "Known limitations".
+    # arguments. network_configuration is ALSO required and is a nested block (needs
+    # exactly 2 subnet_ids across different AZs plus at least one security_group_id)
+    # — now emitted via nested_blocks.
     ResourceDefinition("aws_mwaa_environment", ("mwaa", "managedairflow"), ("airflow", "mwaa"),
                         default_attributes={
                             "name": "replace-with-environment-name",
                             "execution_role_arn": _FAKE_IAM_ROLE_ARN,
                             "source_bucket_arn": _FAKE_S3_BUCKET_ARN,
                             "dag_s3_path": "dags/",
+                        },
+                        nested_blocks={
+                            "network_configuration": [{
+                                "subnet_ids": ["subnet-00000000000000000", "subnet-00000000000000001"],
+                                "security_group_ids": ["sg-00000000000000000"],
+                            }],
                         }),
 
     # --- IAM / Security ------------------------------------------------------
@@ -285,11 +409,19 @@ CATALOG: list[ResourceDefinition] = [
                             "domain_name": "replace-with-your-domain.example.com",
                             "validation_method": "DNS",
                         }),
-    # metric_name is a required flat argument. default_action is ALSO required but is a
-    # nested block (`default_action { allow {} }` / `block {}`) — same generator
-    # limitation as elsewhere, flagged in README's "Known limitations".
+    # metric_name is a required flat argument. default_action is ALSO required and is a
+    # nested block (`default_action { type = "ALLOW" }`) — now emitted via nested_blocks.
+    # A real `terraform validate` run (2026-07) caught that `name` is also required
+    # with no default — same class of miss as aws_eks_cluster above (this type was
+    # already flagged block-incomplete, so its flat args got less audit scrutiny).
     ResourceDefinition("aws_waf_web_acl", ("waf",), ("waf", "web acl"),
-                        default_attributes={"metric_name": "replaceWithMetricName"}),
+                        default_attributes={
+                            "name": "replace-with-web-acl-name",
+                            "metric_name": "replaceWithMetricName",
+                        },
+                        nested_blocks={
+                            "default_action": [{"type": "ALLOW"}],
+                        }),
     ResourceDefinition("aws_cognito_user_pool", ("cognito",), ("cognito", "user pool"),
                         default_attributes={"name": "replace-with-user-pool-name"}),
 
@@ -324,21 +456,79 @@ CATALOG: list[ResourceDefinition] = [
                         }),
 
     # --- Misc -------------------------------------------------------------
-    # name and role_arn are required flat arguments. artifact_store and stage are ALSO
-    # required but are nested HCL blocks — same generator limitation noted elsewhere,
-    # flagged in README's "Known limitations".
-    ResourceDefinition("aws_codepipeline", ("codepipeline",), ("codepipeline", "ci/cd pipeline"),
-                        default_attributes={
-                            "name": "replace-with-pipeline-name",
-                            "role_arn": _FAKE_IAM_ROLE_ARN,
-                        }),
+    # name and role_arn are required flat arguments. artifact_store and stage (at
+    # least two: a Source stage and a downstream stage) are ALSO required and are
+    # nested HCL blocks — now emitted via nested_blocks. Each stage's `action` is
+    # itself a nested block (can repeat) inside the stage block, while `configuration`
+    # inside an action is a genuine map-typed *attribute* (not a block) — Block() is
+    # used only where the provider schema actually expects block syntax, so
+    # `configuration` stays a plain dict and renders with `=` via hcl_value.
+    ResourceDefinition(
+        "aws_codepipeline", ("codepipeline",), ("codepipeline", "ci/cd pipeline"),
+        default_attributes={
+            "name": "replace-with-pipeline-name",
+            "role_arn": _FAKE_IAM_ROLE_ARN,
+        },
+        nested_blocks={
+            "artifact_store": [{
+                "location": "replace-with-artifact-bucket-name",
+                "type": "S3",
+            }],
+            "stage": [
+                {
+                    "name": "Source",
+                    "action": [Block({
+                        "name": "Source",
+                        "category": "Source",
+                        "owner": "AWS",
+                        "provider": "S3",
+                        "version": "1",
+                        "output_artifacts": ["source_output"],
+                        "configuration": {
+                            "S3Bucket": "replace-with-artifact-bucket-name",
+                            "S3ObjectKey": "replace-with-source.zip",
+                        },
+                    })],
+                },
+                {
+                    "name": "Build",
+                    "action": [Block({
+                        "name": "Build",
+                        "category": "Build",
+                        "owner": "AWS",
+                        "provider": "CodeBuild",
+                        "version": "1",
+                        "input_artifacts": ["source_output"],
+                        "output_artifacts": ["build_output"],
+                        "configuration": {
+                            "ProjectName": "replace-with-codebuild-project-name",
+                        },
+                    })],
+                },
+            ],
+        },
+    ),
     # name and service_role are required flat arguments. artifacts/environment/source
-    # are ALSO required but are nested blocks — same generator limitation, flagged.
-    ResourceDefinition("aws_codebuild_project", ("codebuild",), ("codebuild",),
-                        default_attributes={
-                            "name": "replace-with-project-name",
-                            "service_role": _FAKE_IAM_ROLE_ARN,
-                        }),
+    # are ALSO required and are nested blocks — now emitted via nested_blocks.
+    # artifacts.type="NO_ARTIFACTS" and source.type="NO_SOURCE" are both valid enum
+    # values that need no companion location, keeping the placeholder minimal while
+    # still satisfying the schema.
+    ResourceDefinition(
+        "aws_codebuild_project", ("codebuild",), ("codebuild",),
+        default_attributes={
+            "name": "replace-with-project-name",
+            "service_role": _FAKE_IAM_ROLE_ARN,
+        },
+        nested_blocks={
+            "artifacts": [{"type": "NO_ARTIFACTS"}],
+            "environment": [{
+                "compute_type": "BUILD_GENERAL1_SMALL",
+                "image": "aws/codebuild/standard:7.0",
+                "type": "LINUX_CONTAINER",
+            }],
+            "source": [{"type": "NO_SOURCE"}],
+        },
+    ),
     ResourceDefinition("aws_ecr_repository", ("ecr", "elasticcontainerregistry"), ("ecr", "container registry"),
                         default_attributes={"name": "replace-with-repository-name"}),
     # Real Terraform AWS provider resource type is aws_sfn_state_machine — there is no
@@ -356,12 +546,18 @@ CATALOG: list[ResourceDefinition] = [
                                 '"States":{"PlaceholderState":{"Type":"Pass","End":true}}}'
                             ),
                         }),
-    # name and role_arn are required flat arguments. command is ALSO required but is a
-    # nested block — same generator limitation noted elsewhere, flagged in README.
+    # name and role_arn are required flat arguments. command is ALSO required and is a
+    # nested block (script_location is its only required sub-argument; the job "type"
+    # via `name` defaults to "glueetl") — now emitted via nested_blocks.
     ResourceDefinition("aws_glue_job", ("glue",), ("glue job", "glue"),
                         default_attributes={
                             "name": "replace-with-job-name",
                             "role_arn": _FAKE_IAM_ROLE_ARN,
+                        },
+                        nested_blocks={
+                            "command": [{
+                                "script_location": "s3://replace-with-scripts-bucket/replace-with-script.py",
+                            }],
                         }),
     ResourceDefinition("aws_athena_workgroup", ("athena",), ("athena",),
                         default_attributes={"name": "replace-with-workgroup-name"}),

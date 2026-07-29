@@ -65,7 +65,14 @@ _OUTPUT_ATTR_BY_TYPE = {
 }
 
 
-def generate_provider_tf(aws_region_var: str = "var.aws_region") -> str:
+def generate_provider_tf(aws_region_var: str = "var.aws_region", needs_random_provider: bool = False) -> str:
+    random_provider_block = (
+        '    random = {\n'
+        '      source  = "hashicorp/random"\n'
+        '      version = "~> 3.6"\n'
+        "    }\n"
+    ) if needs_random_provider else ""
+
     return (
         'terraform {\n'
         '  required_version = ">= 1.5.0"\n'
@@ -74,6 +81,7 @@ def generate_provider_tf(aws_region_var: str = "var.aws_region") -> str:
         '      source  = "hashicorp/aws"\n'
         '      version = "~> 5.0"\n'
         "    }\n"
+        f"{random_provider_block}"
         "  }\n"
         "}\n\n"
         "provider \"aws\" {\n"
@@ -111,7 +119,15 @@ def generate_main_tf(graph: ResourceGraph) -> str:
         if wiring_warning:
             comment += f" — NOTE: {wiring_warning}"
 
-        blocks.append(resource_block(resource.resource_type, resource.terraform_name, attrs, comment))
+        blocks.append(resource_block(
+            resource.resource_type, resource.terraform_name, attrs, comment,
+            nested_blocks=resource.nested_blocks,
+        ))
+        # Extra top-level resources this one depends on (e.g. aws_mq_broker's
+        # random_password/Secrets Manager pair — see classifier.py's
+        # _build_mq_broker_companion_blocks()). Emitted right after their
+        # owner for readability; Terraform resolves dependency order itself.
+        blocks.extend(resource.companion_blocks)
 
     if not blocks:
         return "# No classifiable resources were found in the supplied diagram.\n"

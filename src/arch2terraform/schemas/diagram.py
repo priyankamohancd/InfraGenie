@@ -70,6 +70,17 @@ class DiagramNode:
     parent_id: str | None = None     # explicit parent from the format (e.g. draw.io group/container)
     source_format: str = "unknown"
     extra: dict = field(default_factory=dict)  # format-specific leftovers, never read downstream
+    # Native custom-data metadata attached to the shape in the diagramming
+    # tool itself — draw.io's "Edit Data" (serialized as an <object>/
+    # <UserObject> wrapper around the <mxCell>), Excalidraw's per-element
+    # `customData` field. Deliberately a real, first-class field (not folded
+    # into `extra`, which is documented as unread downstream) since this IS
+    # meant to be read downstream: it's how a diagram stays the source of
+    # truth for policy-relevant intent (tier=prod, pii=true, public=true)
+    # without that intent living in a second file. Empty for untagged shapes
+    # and for formats that can't carry it (Lucidchart's CSV export has no
+    # custom-data column — see lucidchart_adapter.py).
+    tags: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

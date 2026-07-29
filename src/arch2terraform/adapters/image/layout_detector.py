@@ -2,9 +2,39 @@
 Stage 1 — Layout / boundary-box detector.
 
 Detects the container hierarchy in a raster architecture diagram using
-classical computer vision (OpenCV). No ML involved — this stage relies on
-the fact that AWS Architecture diagrams always use specific, well-defined
-colors and shapes for boundary boxes:
+classical computer vision (OpenCV).
+
+COLOR-AGNOSTIC REDESIGN (2026-07-28)
+-------------------------------------
+Root cause found 2026-07-27/28: a real user diagram's container borders were
+verified (via direct pixel sampling guided by Canny edge detection) to be a
+light, low-saturation blue (BGR≈200,150,130 → HSV H≈109-111, S≈50-70,
+V≈200-234) that falls OUTSIDE every one of the 5 hardcoded
+``DEFAULT_COLOR_PROFILES`` HSV ranges below — so Stage 1 found zero
+containers on that diagram (and, downstream, the classifier never saw a VPC,
+subnets, or the EKS cluster boundary at all). AWS diagrams "in the wild" are
+routinely re-themed, hand-drawn, or exported from tools with different
+default palettes, so any FIXED set of color ranges is inherently brittle.
+
+Detection is now primarily STRUCTURAL, not color-based: Stage 1 finds
+straight border segments with a Canny + probabilistic Hough line transform,
+merges collinear fragments, and assembles matching horizontal/vertical line
+quadruples into rectangle candidates — completely independent of hue. This
+was verified empirically against the real failing diagram: the Hough-line
+approach correctly recovered the true VPC boundary (and nested subnet / EKS
+boundaries) that the color-profile approach missed entirely.
+
+Color is now used only as a SOFT hint, applied after a rectangle is already
+structurally confirmed: sampled border-pixel colors are matched against the
+well-known AWS palette below (``DEFAULT_COLOR_PROFILES``) to assign a
+specific ``ContainerType`` (VPC/AWS_CLOUD/AZ/SUBNET) when they match a known
+convention. When they don't match any known color, the region is still kept
+— never silently dropped — as ``ContainerType.UNKNOWN``, to be resolved
+later by OCR label-text matching in the classifier (mirroring how
+unclassified icon nodes are already handled, never dropped, elsewhere in the
+pipeline).
+
+Known AWS diagram color/style conventions (used only for the soft type hint):
 
     Container type       Color                Hex       Style
     ───────────────────  ───────────────────  ────────  ──────
@@ -175,6 +205,26 @@ class DetectorConfig:
     min_side_length:   int = 40     # px — ignore very thin strips
     max_bbox_fraction: float = 0.98 # ignore rectangles that fill almost the whole image
 
+    # ---- Icon/container color collision guard ----
+    # VPC (green/purple) and AWS Cloud (navy) all use *solid* borders — and so
+    # do several individual AWS4 resource icons (e.g. Application Load
+    # Balancer, Internet Gateway, and Route 53 all render with purple or
+    # green circular strokes). A single icon glyph can satisfy every other
+    # contour filter above (area, side length) on a large enough source
+    # image, and gets misdetected as its own VPC/Cloud container — found
+    # 2026-07-24 via a real hand-composited test PNG where 3 of 5 "VPC"
+    # detections turned out to be 90x90px squares (individual icon
+    # outlines), producing 3 phantom aws_vpc resources downstream.
+    # Real container boundaries always enclose other diagram content, so
+    # they are (a) far larger than any icon — Stage 2a's own icon detector
+    # caps icon side length at 160px, so 200x200=40,000px² is a safe floor
+    # — and (b) rarely near-square, unlike icon glyphs which are always
+    # drawn in a square bounding box. A region is treated as icon-shaped
+    # (and excluded from VPC/AWS_CLOUD classification) only when BOTH
+    # conditions hold, so a genuinely square-but-large VPC is never dropped.
+    icon_collision_max_area:       float = 40_000  # px² (~200x200) — below this, could be an icon
+    icon_collision_aspect_tolerance: float = 0.35  # |w-h|/max(w,h) <= this counts as "square"
+
     # ---- Dashed-line detection ----
     # Sample a strip this wide along each bbox edge in the original (pre-dilation) mask.
     dash_sample_width: int = 6      # px on each side of the nominal edge
@@ -195,6 +245,39 @@ class DetectorConfig:
     color_profiles: list[ColorProfile] = field(
         default_factory=lambda: list(DEFAULT_COLOR_PROFILES)
     )
+
+    # ---- Structural (color-agnostic) edge detection ----
+    # See module docstring "COLOR-AGNOSTIC REDESIGN". Canny edge map fed to
+    # a probabilistic Hough transform to find straight border segments,
+    # independent of border hue/saturation/value.
+    edge_canny_lo:            int = 30
+    edge_canny_hi:            int = 100
+    edge_hough_threshold:     int = 60    # HoughLinesP accumulator threshold
+    edge_hough_min_len:       int = 80    # px — minimum raw segment length
+    edge_hough_max_gap:       int = 25    # px — max gap to bridge into one segment
+    edge_line_axis_tol:       int = 4     # px — max perpendicular deviation to count as "straight"
+    # Only consider merged lines at least this fraction of the image's
+    # width/height as candidate container walls — filters out short
+    # fragments from icons, text, and arrows before the (expensive)
+    # rectangle-assembly pass.
+    edge_min_line_frac:       float = 0.15
+    edge_merge_gap:           int = 30    # px — bridge gaps this size when merging collinear segments
+    edge_merge_axis_tol:      int = 6     # px — bucket tolerance across the perpendicular axis
+    # When assembling a top/bottom horizontal pair into a rectangle, a
+    # vertical line is accepted as that rectangle's left/right wall if it
+    # passes within this many px of the target x (or y, for horizontals)...
+    edge_corner_tol:          int = 25
+    # ...AND its span overlaps the opposite pair's span by at least this
+    # fraction (handles Hough fragmenting near corners rather than
+    # requiring the wall to reach the exact corner pixel).
+    edge_corner_overlap_frac: float = 0.6
+    # Minimum "weakest side" edge-pixel density (on a dilated edge map)
+    # required to accept an assembled rectangle — real container walls
+    # score well above this; spurious line-quadruple combinations
+    # (unrelated lines that happen to loosely align) score far lower,
+    # verified empirically against the real failing diagram.
+    edge_fill_min_ratio:      float = 0.30
+    edge_dilate_kernel:       int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +301,250 @@ def _close_mask(mask: np.ndarray, cfg: DetectorConfig) -> np.ndarray:
         (cfg.close_kernel_size, cfg.close_kernel_size),
     )
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=cfg.close_iterations)
+
+
+def _detect_edge_lines(
+    gray: np.ndarray,
+    cfg: DetectorConfig,
+) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float]]]:
+    """
+    Structural, color-agnostic line detection (see module docstring).
+
+    Returns (horiz, vert):
+      horiz: list of (x_start, x_end, y)   — merged near-horizontal segments
+      vert:  list of (y_start, y_end, x)   — merged near-vertical segments
+    Only segments at least ``edge_min_line_frac`` of the image's relevant
+    dimension survive — short fragments from icons/text/arrows are dropped
+    here so the O(n²) rectangle-assembly pass stays cheap and clean.
+    """
+    img_h, img_w = gray.shape
+    edges = cv2.Canny(gray, cfg.edge_canny_lo, cfg.edge_canny_hi)
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 180,
+        threshold=cfg.edge_hough_threshold,
+        minLineLength=cfg.edge_hough_min_len,
+        maxLineGap=cfg.edge_hough_max_gap,
+    )
+    raw_h: list[tuple[float, float, float]] = []
+    raw_v: list[tuple[float, float, float]] = []
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            if abs(y2 - y1) <= cfg.edge_line_axis_tol and abs(x2 - x1) >= cfg.edge_hough_min_len:
+                raw_h.append((float(min(x1, x2)), float(max(x1, x2)), float((y1 + y2) / 2)))
+            elif abs(x2 - x1) <= cfg.edge_line_axis_tol and abs(y2 - y1) >= cfg.edge_hough_min_len:
+                raw_v.append((float(min(y1, y2)), float(max(y1, y2)), float((x1 + x2) / 2)))
+
+    horiz = _merge_collinear(raw_h, tol=cfg.edge_merge_axis_tol, gap=cfg.edge_merge_gap)
+    vert = _merge_collinear(raw_v, tol=cfg.edge_merge_axis_tol, gap=cfg.edge_merge_gap)
+
+    # Length floor: the SMALLER of "a legitimate container wall
+    # (min_side_length)" and "a meaningful fraction of the image". Using
+    # only the fraction-based cutoff would (and, caught by
+    # test_layout_detector.py, did) filter out genuinely small containers
+    # like Security Groups on a large canvas; using only min_side_length
+    # lets through too much icon/text/arrow noise on dense real diagrams.
+    # Taking the smaller of the two keeps small-but-real containers while
+    # still pruning short fragments on big images.
+    min_h_len = min(cfg.min_side_length, cfg.edge_min_line_frac * img_w)
+    min_v_len = min(cfg.min_side_length, cfg.edge_min_line_frac * img_h)
+    horiz = [l for l in horiz if (l[1] - l[0]) >= min_h_len]
+    vert = [l for l in vert if (l[1] - l[0]) >= min_v_len]
+    return horiz, vert
+
+
+def _merge_collinear(
+    lines: list[tuple[float, float, float]],
+    tol: int,
+    gap: int,
+) -> list[tuple[float, float, float]]:
+    """
+    Merge near-duplicate/fragmented segments that lie on (roughly) the same
+    line — buckets by the perpendicular coordinate (within ``tol``), then
+    within each bucket merges runs whose spans are within ``gap`` px of each
+    other. Works identically for horizontal (x_start,x_end,y) and vertical
+    (y_start,y_end,x) tuples since both are (span_start, span_end, axis).
+    """
+    if not lines:
+        return []
+    buckets: dict[int, list[tuple[float, float, float]]] = {}
+    for s0, s1, axis in lines:
+        buckets.setdefault(round(axis / max(tol, 1)), []).append((s0, s1, axis))
+
+    merged: list[tuple[float, float, float]] = []
+    for group in buckets.values():
+        group.sort(key=lambda l: l[0])
+        cur_s0, cur_s1, axes = group[0][0], group[0][1], [group[0][2]]
+        for s0, s1, axis in group[1:]:
+            if s0 <= cur_s1 + gap:
+                cur_s1 = max(cur_s1, s1)
+                axes.append(axis)
+            else:
+                merged.append((cur_s0, cur_s1, sum(axes) / len(axes)))
+                cur_s0, cur_s1, axes = s0, s1, [axis]
+        merged.append((cur_s0, cur_s1, sum(axes) / len(axes)))
+    return merged
+
+
+def _edge_fill_ratio(
+    dilated_edges: np.ndarray,
+    x: int, y: int, w: int, h: int,
+    band: int,
+) -> float:
+    """
+    Fraction of edge-map pixels along each of the 4 sides of (x,y,w,h) that
+    are actually edge pixels, sampled every 2px. Returns the WEAKEST side's
+    score — a genuine rectangle wall has strong edges on all 4 sides; a
+    spurious combination assembled from unrelated lines typically has at
+    least one side with little/no real edge support.
+    """
+    img_h, img_w = dilated_edges.shape
+    x2, y2 = x + w, y + h
+
+    def _side_ratio(pts: list[tuple[int, int]]) -> float:
+        hits = 0
+        total = 0
+        for px, py in pts:
+            if 0 <= px < img_w and 0 <= py < img_h:
+                total += 1
+                if dilated_edges[py, px] > 0:
+                    hits += 1
+        return hits / total if total else 0.0
+
+    top = [(px, py) for px in range(x, x2, 2) for py in range(max(0, y - band), y + band + 1)]
+    bottom = [(px, py) for px in range(x, x2, 2) for py in range(max(0, y2 - band), y2 + band + 1)]
+    left = [(px, py) for py in range(y, y2, 2) for px in range(max(0, x - band), x + band + 1)]
+    right = [(px, py) for py in range(y, y2, 2) for px in range(max(0, x2 - band), x2 + band + 1)]
+
+    return min(_side_ratio(top), _side_ratio(bottom), _side_ratio(left), _side_ratio(right))
+
+
+def _assemble_rectangles(
+    horiz: list[tuple[float, float, float]],
+    vert: list[tuple[float, float, float]],
+    cfg: DetectorConfig,
+) -> list[tuple[int, int, int, int]]:
+    """
+    Pair up (top, bottom) horizontal lines with matching (left, right)
+    vertical walls into rectangle candidates — the structural core of the
+    color-agnostic redesign. A vertical line is accepted as a wall when it
+    passes within ``edge_corner_tol`` px of the target x AND its y-span
+    covers at least ``edge_corner_overlap_frac`` of the candidate box's
+    height (Hough fragments near corners rather than reaching the exact
+    corner pixel, so exact-endpoint matching is too strict).
+    """
+    rects: list[tuple[int, int, int, int]] = []
+    for i, h1 in enumerate(horiz):
+        for h2 in horiz[i + 1:]:
+            top, bottom = (h1, h2) if h1[2] < h2[2] else (h2, h1)
+            box_h = bottom[2] - top[2]
+            if box_h < cfg.min_side_length:
+                continue
+            x_lo = max(top[0], bottom[0])
+            x_hi = min(top[1], bottom[1])
+            if x_hi - x_lo < cfg.min_side_length:
+                continue
+            left_x = min(top[0], bottom[0])
+            right_x = max(top[1], bottom[1])
+
+            def _has_wall(target_x: float) -> bool:
+                for vy0, vy1, vx in vert:
+                    if abs(vx - target_x) > cfg.edge_corner_tol:
+                        continue
+                    overlap = max(0.0, min(vy1, bottom[2]) - max(vy0, top[2]))
+                    if overlap >= cfg.edge_corner_overlap_frac * box_h:
+                        return True
+                return False
+
+            if _has_wall(left_x) and _has_wall(right_x):
+                rects.append((int(left_x), int(top[2]), int(right_x - left_x), int(bottom[2] - top[2])))
+    return rects
+
+
+def _min_side_color_ratio(
+    color_mask: np.ndarray,
+    x: int, y: int, w: int, h: int,
+    cfg: DetectorConfig,
+) -> float:
+    """
+    Like ``_measure_fill_ratio`` but returns the WEAKEST of the 4 sides
+    instead of a single pooled fraction across all of them.
+
+    Real bug found during the color-agnostic redesign: the structural
+    rectangle-assembly pass can legitimately close a box using an INTERIOR
+    divider line as one side (e.g. an AZ/Subnet divider inside a VPC) paired
+    with the VPC's own long outer walls as its other two sides — this
+    produces a geometrically real but semantically spurious nested
+    rectangle. A pooled fill_ratio across all sides scores this fairly high
+    (3 of its 4 sides genuinely are VPC-green), so it was being confidently
+    (mis)classified as its own separate VPC — 4 phantom "vpc" detections
+    from one real VPC, confirmed by reproducing against the aws_icon_diagram
+    fixture. Requiring every side individually — not just the pooled
+    average — to show the color kills these partial/composite matches,
+    since the one side that's actually a different container's border
+    (or an interior divider) won't carry that color at all.
+    """
+    sw = cfg.dash_sample_width
+    img_h, img_w = color_mask.shape
+
+    def _safe_slice(r0, r1, c0, c1):
+        r0, r1 = max(0, r0), min(img_h, r1)
+        c0, c1 = max(0, c0), min(img_w, c1)
+        return color_mask[r0:r1, c0:c1]
+
+    sides = [
+        _safe_slice(y - sw, y + sw, x, x + w),
+        _safe_slice(y + h - sw, y + h + sw, x, x + w),
+        _safe_slice(y, y + h, x - sw, x + sw),
+        _safe_slice(y, y + h, x + w - sw, x + w + sw),
+    ]
+    ratios = []
+    for s in sides:
+        if s.size == 0:
+            ratios.append(0.0)
+        else:
+            ratios.append(float(np.count_nonzero(s)) / s.size)
+    return min(ratios)
+
+
+def _classify_region_color(
+    hsv: np.ndarray,
+    x: int, y: int, w: int, h: int,
+    cfg: DetectorConfig,
+) -> tuple[ContainerType, str]:
+    """
+    Soft color hint (see module docstring). For SOLID-style profiles
+    (VPC/AWS Cloud), requires ALL FOUR sides to individually show that color
+    above a low bar — see ``_min_side_color_ratio``'s docstring: pooling
+    across sides let a box built from 3 real VPC walls + 1 unrelated
+    interior divider line score high enough to be misclassified as its own
+    separate VPC (4 phantom VPCs from 1 real one, confirmed against the
+    aws_icon_diagram fixture). DASHED-style profiles (AZ/Subnet) keep the
+    original pooled fill_ratio instead: dashed strokes routinely have a gap
+    fall exactly on one sampled side, so requiring every side to
+    individually clear the bar is too strict and was observed to
+    misclassify real subnets/AZs as UNKNOWN. If no profile clears its bar,
+    the region stays UNKNOWN — a hint, not a gate; nothing is ever rejected
+    outright for failing to match a known color, it just doesn't get a
+    specific type.
+    """
+    best_type = ContainerType.UNKNOWN
+    best_name = "generic_edge"
+    best_margin = 0.0  # score - threshold, so different scales stay comparable
+    for profile in cfg.color_profiles:
+        mask = _build_color_mask(hsv, profile)
+        if profile.expected_style == "solid":
+            score = _min_side_color_ratio(mask, x, y, w, h, cfg)
+            threshold = 0.12
+        else:
+            score = _measure_fill_ratio(mask, x, y, w, h, cfg)
+            threshold = 0.15
+        margin = score - threshold
+        if margin > 0 and margin > best_margin:
+            best_margin = margin
+            best_type = profile.container_type
+            best_name = profile.name
+    return best_type, best_name
 
 
 def _contours_as_rects(
@@ -343,14 +670,28 @@ def _build_containment_hierarchy(
     A region B is a child of A when:
     - A's area > B's area * containment_size_ratio  (A is meaningfully larger)
     - B's bbox overlaps A's bbox by >= containment_overlap_frac of B's area
-    - Among all valid parents, pick the smallest one (immediate parent).
+    - Among all valid parents, prefer a KNOWN (non-UNKNOWN) container_type
+      over an UNKNOWN one, then pick the smallest (immediate parent).
+
+    The known-over-unknown preference matters for the color-agnostic
+    structural detector: it can produce a spurious UNKNOWN composite
+    rectangle that happens to sit strictly between a real child and its real
+    (KNOWN-typed) parent in size — e.g. built from the real parent's own
+    top/left/right walls plus an unrelated interior line as its 4th side.
+    Picking "smallest valid parent" alone would wire the child to that
+    artifact instead of the real container it visually belongs to (caught
+    by test_inner_subnet_parent_is_vpc). An UNKNOWN region is only used as
+    a parent when no KNOWN region qualifies at all — it's still kept as a
+    fallback so orphaned children never silently lose their nesting.
     """
     # Sort largest → smallest so we iterate parents before children.
     sorted_regions = sorted(regions, key=lambda r: r.area, reverse=True)
 
     for i, child in enumerate(sorted_regions):
-        best_parent: ContainerRegion | None = None
-        best_parent_area: float = float("inf")
+        best_known_parent: ContainerRegion | None = None
+        best_known_area: float = float("inf")
+        best_unknown_parent: ContainerRegion | None = None
+        best_unknown_area: float = float("inf")
 
         for j, parent in enumerate(sorted_regions):
             if i == j:
@@ -360,10 +701,16 @@ def _build_containment_hierarchy(
             overlap = _bbox_overlap_fraction(child.bbox, parent.bbox)
             if overlap < cfg.containment_overlap_frac:
                 continue
-            if parent.area < best_parent_area:
-                best_parent_area = parent.area
-                best_parent = parent
+            if parent.container_type == ContainerType.UNKNOWN:
+                if parent.area < best_unknown_area:
+                    best_unknown_area = parent.area
+                    best_unknown_parent = parent
+            else:
+                if parent.area < best_known_area:
+                    best_known_area = parent.area
+                    best_known_parent = parent
 
+        best_parent = best_known_parent if best_known_parent is not None else best_unknown_parent
         child.parent_id = best_parent.node_id if best_parent else None
 
     return sorted_regions
@@ -422,76 +769,160 @@ def detect_containers_from_array(
     # Preprocess
     blurred = cv2.GaussianBlur(img_bgr, (cfg.blur_kernel_size, cfg.blur_kernel_size), 0)
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+
+    # ── Structural (color-agnostic) candidate generation ──────────────────
+    # See module docstring "COLOR-AGNOSTIC REDESIGN": borders are found by
+    # shape (straight edges forming closed rectangles), not by hue, so this
+    # works regardless of the diagram's actual color palette.
+    horiz, vert = _detect_edge_lines(gray, cfg)
+    logger.debug("  structural: %d horizontal / %d vertical candidate walls", len(horiz), len(vert))
+
+    edges = cv2.Canny(gray, cfg.edge_canny_lo, cfg.edge_canny_hi)
+    dilated_edges = cv2.dilate(
+        edges, np.ones((cfg.edge_dilate_kernel, cfg.edge_dilate_kernel), np.uint8), iterations=1
+    )
+
+    candidate_rects = _assemble_rectangles(horiz, vert, cfg)
+    img_area = img_h * img_w
+    candidate_rects = [
+        (x, y, w, h) for (x, y, w, h) in candidate_rects
+        if w * h <= cfg.max_bbox_fraction * img_area
+        and w * h >= cfg.min_bbox_area
+        and w >= cfg.min_side_length and h >= cfg.min_side_length
+    ]
+    logger.debug("  structural: %d assembled rectangle candidates", len(candidate_rects))
 
     raw_regions: list[ContainerRegion] = []
 
-    for profile in cfg.color_profiles:
-        original_mask = _build_color_mask(hsv, profile)
-        # Only apply morphological close for dashed-border profiles — it bridges
-        # dash gaps to form a solid closed contour. For solid profiles, close
-        # expands the thin border ring to fill the entire image boundary, causing
-        # the bounding rect to span the full canvas and get filtered out.
-        if profile.expected_style == "dashed":
-            closed_mask = _close_mask(original_mask, cfg)
-        else:
-            closed_mask = original_mask
-
-        candidate_rects = _contours_as_rects(closed_mask, img_h, img_w, cfg)
-        logger.debug(
-            "  profile '%s': %d candidate rects", profile.name, len(candidate_rects)
-        )
-
-        for (x, y, w, h) in candidate_rects:
-            fill_ratio = _measure_fill_ratio(original_mask, x, y, w, h, cfg)
-
-            # Border style classification:
-            # The profile's expected_style is used as the primary indicator,
-            # because fill_ratio alone is unreliable for thin solid borders
-            # (sampling a 12px strip around a 4px border dilutes the fill signal).
-            # fill_ratio is only used to catch clearly wrong detections.
-            if profile.expected_style == "solid":
-                # Very low fill_ratio on a "solid" profile → likely a noise contour.
-                if fill_ratio < 0.20:
-                    logger.debug(
-                        "    Skip: %s fill_ratio=%.2f too low for solid", profile.name, fill_ratio
-                    )
-                    continue
-                border_style = "solid"
-            elif profile.expected_style == "dashed":
-                # Very high fill_ratio on a "dashed" profile → likely a solid rect
-                # mismatched to this profile (e.g. filled background artifacts).
-                if fill_ratio > 0.85:
-                    logger.debug(
-                        "    Skip: %s fill_ratio=%.2f too high for dashed", profile.name, fill_ratio
-                    )
-                    continue
-                border_style = "dashed"
-            else:
-                # "either" — let the raw fill_ratio decide
-                border_style = "dashed" if fill_ratio < cfg.dash_threshold else "solid"
-
-            bbox = BoundingBox(x=float(x), y=float(y), width=float(w), height=float(h))
-            region = ContainerRegion(
-                node_id        = str(uuid.uuid4()),
-                bbox           = bbox,
-                container_type = profile.container_type,
-                color_profile  = profile.name,
-                border_style   = border_style,
-                fill_ratio     = fill_ratio,
-                area           = float(w * h),
-            )
-            raw_regions.append(region)
+    for (x, y, w, h) in candidate_rects:
+        # Structural confidence guard: a genuine rectangular wall has strong
+        # edge support on all 4 sides; a spurious pairing of unrelated lines
+        # (loose corner-tolerance matches) typically has at least one weak
+        # side. Verified empirically against the real diagram that motivated
+        # this redesign — see module docstring.
+        edge_fill = _edge_fill_ratio(dilated_edges, x, y, w, h, band=cfg.edge_dilate_kernel + 1)
+        if edge_fill < cfg.edge_fill_min_ratio:
             logger.debug(
-                "    + %s  bbox=(%d,%d,%d,%d)  fill=%.2f  style=%s",
-                profile.name, x, y, w, h, fill_ratio, border_style,
+                "    Skip: bbox=(%d,%d,%d,%d) edge_fill=%.2f below threshold — likely spurious",
+                x, y, w, h, edge_fill,
             )
+            continue
+
+        # Color is now a soft hint applied AFTER structural confirmation —
+        # never a gate. Unmatched borders stay ContainerType.UNKNOWN and are
+        # still kept (resolved later via OCR label matching downstream).
+        container_type, color_profile = _classify_region_color(hsv, x, y, w, h, cfg)
+
+        # Sliver guard, UNKNOWN regions only: a >8:1 aspect ratio box that
+        # doesn't even match a known color is a leftover line-pairing
+        # artifact (e.g. a thin strip formed between two nearby dashed
+        # borders), not a real container — no real AWS Cloud/VPC/AZ/Subnet
+        # is drawn that elongated. Confirmed against the aws_icon_diagram
+        # fixture: a spurious 1223x61 (20:1) sliver directly above the real
+        # Subnet was surviving every other filter and being classified as a
+        # phantom aws_vpc downstream by the classifier's generic container
+        # fallback. Regions with a KNOWN color match are exempt — a real
+        # narrow Subnet band is legitimate and must never be dropped.
+        if container_type == ContainerType.UNKNOWN:
+            aspect = max(w, h) / max(min(w, h), 1)
+            if aspect > 8.0:
+                logger.debug(
+                    "    Skip: bbox=(%d,%d,%d,%d) aspect=%.1f — unclassified sliver, not a container",
+                    x, y, w, h, aspect,
+                )
+                continue
+
+        # Border style: reuse the known profile's expected style when we have
+        # a color match; otherwise fall back to the generic edge-density
+        # comparison against dash_threshold.
+        matched_profile = next((p for p in cfg.color_profiles if p.name == color_profile), None)
+        if matched_profile is not None and matched_profile.expected_style in ("solid", "dashed"):
+            border_style = matched_profile.expected_style
+        else:
+            border_style = "dashed" if edge_fill < cfg.dash_threshold else "solid"
+
+        # Icon/container collision guard — see DetectorConfig's
+        # icon_collision_max_area docstring. Restored to its original scope:
+        # only SOLID-style regions are prone to being an individual icon's
+        # own outline (VPC/AWS Cloud render as solid strokes, and so do
+        # several AWS4 icon glyphs like ALB/IGW/Route53). Dashed regions
+        # (subnets, security groups, AZs) are deliberately exempt — a small
+        # dashed square is a legitimate Security Group, not a phantom icon.
+        # Applying this guard to dashed regions too (tried during this
+        # redesign) broke SECURITY_GROUP disambiguation, since small SGs are
+        # exactly the shape/size this guard is built to reject — caught by
+        # the existing test_layout_detector.py suite.
+        if border_style == "solid":
+            area = w * h
+            aspect_delta = abs(w - h) / max(w, h)
+            if area < cfg.icon_collision_max_area and aspect_delta <= cfg.icon_collision_aspect_tolerance:
+                logger.debug(
+                    "    Skip: bbox=(%d,%d,%d,%d) area=%d aspect_delta=%.2f — icon-shaped, not a container",
+                    x, y, w, h, area, aspect_delta,
+                )
+                continue
+
+        bbox = BoundingBox(x=float(x), y=float(y), width=float(w), height=float(h))
+        region = ContainerRegion(
+            node_id        = str(uuid.uuid4()),
+            bbox           = bbox,
+            container_type = container_type,
+            color_profile  = color_profile,
+            border_style   = border_style,
+            fill_ratio     = edge_fill,
+            area           = float(w * h),
+        )
+        raw_regions.append(region)
+        logger.debug(
+            "    + %s  bbox=(%d,%d,%d,%d)  edge_fill=%.2f  style=%s  type=%s",
+            color_profile, x, y, w, h, edge_fill, border_style, container_type.value,
+        )
 
     if not raw_regions:
         logger.warning("Stage 1: no container regions detected")
         return []
 
-    # De-duplicate: if two regions from different profiles have very similar
-    # bboxes, keep the one with the larger fill_ratio (more confident).
+    # De-duplicate near-identical-bbox composites BEFORE type-based dedup.
+    # Real bug found during this redesign: the structural rectangle
+    # assembly can close a box using one container's true outer walls
+    # paired with an unrelated nearby line as its 4th side (e.g. the AWS
+    # Cloud's own walls plus the VPC's top edge one side over) — the result
+    # is a "container-shaped" bbox that's almost, but not exactly, the same
+    # as a real one. It usually resolves to UNKNOWN (its color doesn't
+    # match on every side) and so survives the type-keyed _deduplicate
+    # below untouched, then corrupts the containment hierarchy by acting as
+    # a same-size sibling/parent for the real container. This pass merges
+    # any two regions whose bboxes are near-identical (>=90% overlap, sizes
+    # within 1.5x of each other) REGARDLESS of resolved type, keeping the
+    # one with a known (non-UNKNOWN) type, or higher fill_ratio on ties.
+    raw_regions = _suppress_near_duplicate_composites(raw_regions)
+
+    # Collapse "wall-reuse chains": on diagrams where NOTHING matches a
+    # known color (Stage 1 stays fully structural — every region UNKNOWN),
+    # _suppress_near_duplicate_composites above can't help, since it only
+    # ever drops UNKNOWN vs. a KNOWN anchor. Real bug found 2026-07-28
+    # against a dense, non-standard-color diagram: the same 3 real walls
+    # (e.g. a container's left, right, and top edge) can each pair with
+    # SEVERAL different plausible 4th walls (different nearby interior
+    # lines), producing a whole chain of nested candidates that share those
+    # 3 walls exactly and differ only in how far the 4th one extends — 21
+    # "subnets" from what was really a handful of real ones, confirmed by
+    # inspecting the raw bboxes (multiple entries sharing identical x/y/w
+    # with only height differing). Ordinary sibling containers (e.g. two
+    # real subnets stacked in the same VPC) also often share a wall, but
+    # their OTHER two edges never overlap each other — only a genuine
+    # same-source chain has one candidate's bbox fully nested inside
+    # another's while still sharing 3 exact walls, which is what this
+    # targets.
+    raw_regions = _collapse_wall_reuse_chains(raw_regions, tol=cfg.edge_corner_tol)
+
+    # De-duplicate: two regions of the SAME resolved container_type with
+    # very similar bboxes are almost certainly the same physical container
+    # found twice (e.g. via slightly different line-quadruple combinations).
+    # container_type (not color_profile) is now the identity key, since
+    # unmatched regions all share color_profile="generic_edge" but may still
+    # be genuinely different nested containers.
     raw_regions = _deduplicate(raw_regions, overlap_threshold=0.85)
 
     # Refine SUBNET vs SECURITY_GROUP by relative size.
@@ -514,6 +945,126 @@ def detect_containers_from_array(
     return [_to_diagram_node(r) for r in regions_with_parents]
 
 
+def _collapse_wall_reuse_chains(
+    regions: list[ContainerRegion],
+    tol: int,
+) -> list[ContainerRegion]:
+    """
+    See call-site comment. Groups regions that share the same LEFT+RIGHT
+    walls (within ``tol`` px) but differ in vertical extent, and separately
+    groups regions sharing the same TOP+BOTTOM walls but differing in
+    horizontal extent. Within each such group, keeps only the LARGEST
+    member (assumed to be the real, complete boundary — Hough line
+    assembly tends to surface the true far wall as one of the candidates,
+    typically the outermost) and drops the smaller ones IF AND ONLY IF the
+    smaller one's bbox is (near-)fully contained within the larger one's —
+    real side-by-side siblings sharing a wall never satisfy this, since
+    their other two edges don't overlap each other.
+    """
+    def _bucket(v: float) -> int:
+        return round(v / max(tol, 1))
+
+    # x-span groups: same left AND right x → compare vertical extent.
+    x_groups: dict[tuple[int, int], list[ContainerRegion]] = {}
+    for r in regions:
+        key = (_bucket(r.bbox.x), _bucket(r.bbox.x + r.bbox.width))
+        x_groups.setdefault(key, []).append(r)
+
+    # y-span groups: same top AND bottom y → compare horizontal extent.
+    y_groups: dict[tuple[int, int], list[ContainerRegion]] = {}
+    for r in regions:
+        key = (_bucket(r.bbox.y), _bucket(r.bbox.y + r.bbox.height))
+        y_groups.setdefault(key, []).append(r)
+
+    to_drop: set[str] = set()
+    for group in list(x_groups.values()) + list(y_groups.values()):
+        if len(group) < 2:
+            continue
+        largest = max(group, key=lambda r: r.area)
+        for r in group:
+            if r.node_id == largest.node_id:
+                continue
+            if _bbox_overlap_fraction(r.bbox, largest.bbox) >= 0.95:
+                to_drop.add(r.node_id)
+
+    return [r for r in regions if r.node_id not in to_drop]
+
+
+def _suppress_near_duplicate_composites(
+    regions: list[ContainerRegion],
+    overlap_threshold: float = 0.90,
+    max_size_ratio: float = 1.5,
+) -> list[ContainerRegion]:
+    """
+    See call-site comment. Drops an UNKNOWN-typed region when its bbox is
+    near-identical to a KNOWN-typed region's — that combination is the
+    actual failure signature of a spurious composite (real AWS Cloud +
+    unrelated line forming a slightly-off duplicate of the Cloud itself,
+    still unclassifiable by color so it stays UNKNOWN).
+
+    Deliberately restricted to KNOWN-vs-UNKNOWN pairs only. A first version
+    of this suppressed any near-identical pair regardless of type and broke
+    real nesting: AWS Cloud and its VPC are often drawn with only a modest
+    margin between them, so a real Cloud/VPC pair can be just as close in
+    size/overlap as a spurious composite is — the VPC (correctly classified
+    as ContainerType.VPC) was being merged away as a "duplicate" of the
+    Cloud, and `test_three_level_nesting` (VPC not detected at all) caught
+    it. Two KNOWN regions are always structurally real, different
+    containers (already handled correctly by the containment hierarchy +
+    type-keyed `_deduplicate`), so they're never touched here.
+    """
+    known = [r for r in regions if r.container_type != ContainerType.UNKNOWN]
+    unknown = [r for r in regions if r.container_type == ContainerType.UNKNOWN]
+
+    def _shares_full_span(u_bbox: BoundingBox, k_bbox: BoundingBox, axis_tol: int = 10) -> bool:
+        """
+        True when u's bbox reuses BOTH of k's walls along one axis (same
+        left+right x, or same top+bottom y, within a small pixel
+        tolerance) while being shorter along the other axis. This is the
+        signature of a composite built from a real container's own outer
+        walls plus one unrelated interior line as the 4th side — e.g. a
+        real VPC's left+right verticals paired with an internal divider
+        instead of the VPC's own top or bottom. Confirmed against the
+        aws_icon_diagram fixture: every spurious leftover UNKNOWN fragment
+        shared its x-span exactly with the real VPC/AWS-Cloud bbox.
+        """
+        same_x_span = (
+            abs(u_bbox.x - k_bbox.x) <= axis_tol
+            and abs((u_bbox.x + u_bbox.width) - (k_bbox.x + k_bbox.width)) <= axis_tol
+        )
+        same_y_span = (
+            abs(u_bbox.y - k_bbox.y) <= axis_tol
+            and abs((u_bbox.y + u_bbox.height) - (k_bbox.y + k_bbox.height)) <= axis_tol
+        )
+        return same_x_span or same_y_span
+
+    kept_unknown: list[ContainerRegion] = []
+    for u in unknown:
+        is_spurious = False
+        for k in known:
+            # Case 1: near-identical bbox to a known region (close in size,
+            # very high overlap) — see docstring above.
+            size_ratio = max(u.area, k.area) / max(min(u.area, k.area), 1.0)
+            if size_ratio <= max_size_ratio:
+                smaller, larger = (u, k) if u.area <= k.area else (k, u)
+                if _bbox_overlap_fraction(smaller.bbox, larger.bbox) >= overlap_threshold:
+                    is_spurious = True
+                    break
+            # Case 2: fully contained within a known region AND reuses that
+            # region's full span on one axis — a "partial crop" composite,
+            # regardless of how much smaller it is on the other axis.
+            if (
+                _bbox_overlap_fraction(u.bbox, k.bbox) >= 0.95
+                and _shares_full_span(u.bbox, k.bbox)
+            ):
+                is_spurious = True
+                break
+        if not is_spurious:
+            kept_unknown.append(u)
+
+    return known + kept_unknown
+
+
 def _deduplicate(
     regions: list[ContainerRegion],
     overlap_threshold: float = 0.85,
@@ -522,22 +1073,26 @@ def _deduplicate(
     Remove duplicate detections of the SAME container.
 
     Two regions are considered duplicates only when:
-    - They come from the SAME color profile (different profiles = different
-      container types → never duplicates, even if one is inside the other)
+    - They resolve to the SAME container_type (different types = different
+      containers → never duplicates, even if one is inside the other)
     - Their bboxes overlap by >= overlap_threshold of the smaller region's area
 
-    The profile guard is critical: a green VPC that completely surrounds an
-    orange Subnet would otherwise score 100% overlap and be wrongly eliminated.
-    A child container is never a duplicate of its parent.
+    The type guard is critical: a VPC that completely surrounds a Subnet
+    would otherwise score 100% overlap and be wrongly eliminated. A child
+    container is never a duplicate of its parent. Uses container_type
+    (not color_profile) as the identity key since the color-agnostic
+    structural detector resolves many regions to the same
+    color_profile="generic_edge" even when they're genuinely different
+    nested containers — container_type is the real semantic identity.
     """
     kept: list[ContainerRegion] = []
     # Process highest-confidence (fill_ratio) first so we keep the better detection.
     for region in sorted(regions, key=lambda r: r.fill_ratio, reverse=True):
         is_duplicate = False
         for existing in kept:
-            # Cross-profile detections are NEVER duplicates — they represent
+            # Cross-type detections are NEVER duplicates — they represent
             # different container types that may legitimately overlap (parent/child).
-            if region.color_profile != existing.color_profile:
+            if region.container_type != existing.container_type:
                 continue
             # Size-ratio guard within the same profile: an orange security group
             # sitting inside an orange subnet is NOT a duplicate — it's a smaller

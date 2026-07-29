@@ -24,6 +24,14 @@ phase3 = [
     "numpy>=1.26",
     "pytesseract>=0.3",
 ]
+# Vision-LLM detection path (adapters/image/vision_llm_detector.py) — an
+# opt-in alternative to the classical phase3 CV cascade, enabled via
+# ImageAdapter(use_vision_llm=True) or the ARCH2TERRAFORM_USE_VISION_LLM env
+# var. Kept as a separate extra rather than folded into phase3 since it's
+# the only piece requiring network access / an API key.
+vision_llm = [
+    "anthropic>=0.120",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

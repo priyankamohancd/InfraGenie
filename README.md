@@ -135,27 +135,47 @@ tests/
   with the real binary after any future catalog change.
 - All 59 catalog entries have now been individually audited against the AWS
   provider's actually-required arguments (`tests/unit/test_catalog.py` locks
-  this in — every entry is either in the audited required-args map or
-  explicitly listed as needing nested-block support, so an unaudited entry
-  can't be silently added again). Two entries had outright wrong Terraform
+  this in — every entry is in the audited required-flat-args map and/or the
+  required-nested-blocks map, so an unaudited entry can't be silently added
+  again). Two entries had outright wrong Terraform
   resource type names (`aws_eventbridge_rule` → `aws_cloudwatch_event_rule`,
   `aws_step_function_state_machine` → `aws_sfn_state_machine`) that would
   have failed `terraform init`/parse immediately — worse than any missing
   argument, since the resource type itself didn't exist in the provider.
-- 10 resource types have a provider-required argument that is itself a
-  *nested HCL block* rather than a flat attribute (`aws_autoscaling_group`'s
-  `launch_template`, `aws_eks_cluster`'s `vpc_config`, `aws_batch_job_queue`'s
+- **Nested HCL blocks are now supported.** 11 resource types have a
+  provider-required argument that is itself a *nested HCL block* rather than
+  a flat attribute (`aws_autoscaling_group`'s `launch_template`,
+  `aws_eks_cluster`'s `vpc_config`, `aws_batch_job_queue`'s
   `compute_environment_order`, `aws_waf_web_acl`'s `default_action`,
   `aws_cloudfront_distribution`'s `origin`/`default_cache_behavior`/
   `restrictions`/`viewer_certificate`, `aws_dynamodb_table`'s `attribute`,
   `aws_mq_broker`'s `user`, `aws_codepipeline`'s `artifact_store`/`stage`,
   `aws_codebuild_project`'s `artifacts`/`environment`/`source`,
-  `aws_glue_job`'s `command`). The generator (`hcl_format.py`) only emits
-  flat `key = value` attribute lines, not nested blocks, so these resources
-  are generated with every flat argument filled in but are still incomplete
-  — real `terraform validate` will flag the missing block. Fixing this
-  properly means teaching the generator to render nested blocks, which is a
-  real feature addition, not a catalog tweak.
+  `aws_glue_job`'s `command`, `aws_mwaa_environment`'s
+  `network_configuration` — the last of these was previously missing from
+  this list even though it had the same gap). `hcl_format.py`'s
+  `resource_block()` now accepts a `nested_blocks` argument and renders real
+  `name { ... }` blocks (as opposed to `name = { ... }` map attributes),
+  including blocks nested inside blocks (e.g. CloudFront's
+  `default_cache_behavior` → `forwarded_values` → `cookies`) via the
+  `hcl_format.Block` marker, which disambiguates "this dict is a block body"
+  from "this dict is a map-typed attribute value" (e.g. CodePipeline
+  action's `configuration` map stays a plain attribute). All 11 types now
+  supply their required block(s) in the catalog, enforced by
+  `test_required_nested_blocks_present` in `tests/unit/test_catalog.py`.
+  `tests/integration/test_nested_block_terraform_validate.py` runs a real
+  `terraform init`/`validate` against all 11 together (the two pre-existing
+  fixture-driven validate tests don't exercise any of them, since neither
+  real reference diagram contains these resource types) — this is what
+  actually caught, past `python-hcl2`'s syntax-only check: `launch_template.id`
+  and `compute_environment` are both format-validated client-side (the former
+  needs an `lt-...` shaped ID, the latter a real ARN shape) and
+  `aws_eks_cluster`/`aws_waf_web_acl` were both missing their required `name`
+  argument (an audit gap from when these types were still flagged
+  block-incomplete and got less scrutiny). All four fixed and locked in by
+  `test_arn_typed_placeholders_are_actually_shaped_like_arns` (now also walks
+  nested blocks, not just flat attributes) and
+  `test_autoscaling_launch_template_id_placeholder_is_shaped_like_a_real_id`.
 - Tesseract still occasionally hallucinates plausible-looking short words
   (not just obvious noise) out of dense dashed-line intersections; the
   height filter in `ocr_extractor.py` catches the common case (thin 2-4px

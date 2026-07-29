@@ -39,8 +39,10 @@ def run_pipeline(input_file: str, output_dir: str) -> PipelineResult:
 
     os.makedirs(output_dir, exist_ok=True)
 
+    needs_random_provider = any(r.companion_blocks for r in graph.resources)
+
     files = {
-        "provider.tf": generate_provider_tf(),
+        "provider.tf": generate_provider_tf(needs_random_provider=needs_random_provider),
         "variables.tf": generate_variables_tf(),
         "main.tf": generate_main_tf(graph),
         "outputs.tf": generate_outputs_tf(graph),

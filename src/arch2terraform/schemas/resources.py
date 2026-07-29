@@ -22,8 +22,28 @@ class ClassifiedResource:
     display_label: str                # original human label, for comments/README
     confidence: float                  # 0.0–1.0, from classifier matching
     attributes: dict = field(default_factory=dict)   # inferred/defaulted TF attributes
+    nested_blocks: dict = field(default_factory=dict)  # required HCL nested blocks, e.g. vpc_config
     is_container: bool = False        # true for VPC/subnet/security-group boxes
     needs_clarification: list[str] = field(default_factory=list)  # ambiguous attrs flagged for Phase 2's clarifier
+    # Carried through unchanged from DiagramNode.tags — the diagram's own
+    # native custom-data metadata (draw.io Edit Data, Excalidraw customData).
+    # Never interpreted here; classification/relationship-resolution doesn't
+    # need it. It exists on this schema purely as a pass-through so
+    # downstream consumers (Phase 2's ParsedResource.tags, and eventually
+    # policy-pack selection) don't need their own separate lookup back to
+    # the original DiagramNode.
+    tags: dict[str, str] = field(default_factory=dict)
+    # Extra, pre-rendered top-level HCL resource blocks that must be emitted
+    # alongside this resource in the same file/module (e.g. a random_password
+    # + aws_secretsmanager_secret pair backing an aws_mq_broker's password,
+    # since unlike RDS/Aurora there's no manage_master_user_password-style
+    # AWS-managed-secret flag for MQ — see classifier.py's
+    # _build_mq_broker_companion_blocks()). Empty for every other resource
+    # type. Rendered as raw HCL text (not another ResourceDefinition) since
+    # these companions don't need their own classification/confidence/
+    # nested_blocks machinery — they exist purely to back one attribute on
+    # the resource that declares them.
+    companion_blocks: list[str] = field(default_factory=list)
 
 
 @dataclass

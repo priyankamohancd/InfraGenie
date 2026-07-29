@@ -59,6 +59,7 @@ def detect_icon_candidates(
     bg_threshold: int = 240,
     arrow_threshold: int = 60,
     max_aspect: float = 2.0,
+    container_bboxes: "list | None" = None,
 ) -> list[IconCandidate]:
     """
     Detect candidate service icon bounding boxes in a BGR diagram image.
@@ -83,6 +84,23 @@ def detect_icon_candidates(
                       Near-black arrows (gray ≈ 30) are excluded; coloured
                       icon backgrounds (gray ≈ 100-200) are included.
     max_aspect      : maximum long:short side ratio (icons are roughly square).
+    container_bboxes: bounding boxes (objects with .x/.y/.width/.height, e.g.
+                      Stage 1's DiagramNode.bbox) of already-detected
+                      containers (VPC/subnet/etc). Real bug found 2026-07-27:
+                      a container that's rendered with a TINTED FILL (not
+                      just an outline) — e.g. a light-blue "Public Subnet"
+                      box — has a grayscale value that also falls inside the
+                      foreground band, so its fill and any icon sitting
+                      inside it merge into ONE contour whose bounding box is
+                      the whole container, which then fails `max_side` and
+                      the icon is lost entirely (confirmed by reproducing:
+                      an EC2 icon sitting on a tinted subnet fill vanished
+                      completely, even though checked in isolation its own
+                      fill/grayscale stats were fine). Passing the container
+                      boxes lets this function sample each one's own
+                      background colour and subtract it locally, so the
+                      icon inside is freed from a single mega-blob rather
+                      than being swallowed by it.
 
     Returns
     -------
@@ -94,6 +112,37 @@ def detect_icon_candidates(
     # Excludes white background (too bright) AND near-black arrows (too dark).
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     fg_mask = ((gray > arrow_threshold) & (gray < bg_threshold)).astype(np.uint8) * 255
+
+    # ── Step 1b: subtract each container's own tinted background fill ────
+    # (see container_bboxes docstring above). Sample a small patch near
+    # each corner of the container (most likely to be plain background,
+    # not an icon, a label, or a border line) and treat any pixel in that
+    # container's box within a tolerance of that colour as background too.
+    for box in (container_bboxes or []):
+        bx, by = int(box.x), int(box.y)
+        bw, bh = int(box.width), int(box.height)
+        bx1, by1 = max(0, bx), max(0, by)
+        bx2, by2 = min(W, bx + bw), min(H, by + bh)
+        if bx2 - bx1 < 10 or by2 - by1 < 10:
+            continue
+        inset = 6
+        samples = [
+            bgr[min(by1 + inset, H - 1), min(bx1 + inset, W - 1)],
+            bgr[min(by1 + inset, H - 1), max(bx2 - inset - 1, 0)],
+            bgr[max(by2 - inset - 1, 0), min(bx1 + inset, W - 1)],
+        ]
+        bg_color = np.median(np.stack(samples), axis=0)
+        # float32, not int16: a per-channel diff up to 255 squares to 65025,
+        # which overflows int16's ±32767 range and wraps to a spurious
+        # negative value — sqrt() of a sum containing one then produces NaN
+        # (observed as a real RuntimeWarning during testing, not just a
+        # theoretical concern).
+        region = bgr[by1:by2, bx1:bx2].astype(np.float32)
+        dist = np.sqrt(np.sum((region - bg_color.astype(np.float32)) ** 2, axis=2))
+        close_to_bg = dist < 18  # small tolerance — real icons differ far more than this
+        region_mask = fg_mask[by1:by2, bx1:bx2]
+        region_mask[close_to_bg] = 0
+        fg_mask[by1:by2, bx1:bx2] = region_mask
 
     # ── Step 2: morphological close to unify icon bodies ─────────────────
     # Kernel 5 px bridges small internal gaps (e.g., gaps between icon
@@ -124,11 +173,20 @@ def detect_icon_candidates(
             continue
 
         # ── Fill check ────────────────────────────────────────────────────
-        # Fraction of the bbox that is non-background.
-        # Dash segments: ~14 px long × 2 px wide → fill ≈ 2/28 = 0.07 (fails).
-        # Service icons: dense coloured square → fill ≥ 0.30 (passes).
-        crop_mask = fg_mask[y : y + h, x : x + w]
-        fill = np.count_nonzero(crop_mask) / (w * h)
+        # Real bug found 2026-07-27: raw pixel-count fill fraction rejects
+        # THIN-OUTLINE icons (e.g. a purple-ring ALB icon with a plain
+        # white interior — common in newer/flat AWS icon sets, not just
+        # the solid-square style this was originally tuned for) even
+        # though they're unambiguously real icons — a thin ring only
+        # covers a few percent of its own bounding box. Using the
+        # contour's CONVEX HULL area instead of raw pixel count fixes this:
+        # a hollow ring's hull is (almost) the full disc it traces out
+        # (~78% of a circle inscribed in a square bbox), so it clears
+        # min_fill easily, while genuinely sparse noise (dash fragments,
+        # stray anti-aliasing) still has a small hull and correctly fails.
+        hull = cv2.convexHull(cnt)
+        hull_area = cv2.contourArea(hull)
+        fill = hull_area / (w * h)
         if fill < min_fill:
             continue
 
@@ -149,9 +207,48 @@ def detect_icon_candidates(
             )
         )
 
+    deduped = _dedupe_overlapping(candidates)
     logger.info(
-        "Icon detector: %d candidates in %dx%d image "
+        "Icon detector: %d candidates (%d before dedup) in %dx%d image "
         "(min_side=%d max_side=%d min_fill=%.2f max_aspect=%.1f)",
-        len(candidates), W, H, min_side, max_side, min_fill, max_aspect,
+        len(deduped), len(candidates), W, H, min_side, max_side, min_fill, max_aspect,
     )
-    return candidates
+    return deduped
+
+
+def _dedupe_overlapping(candidates: list[IconCandidate], iou_threshold: float = 0.5) -> list[IconCandidate]:
+    """
+    Real bug found 2026-07-27, introduced by this same session's own
+    convex-hull fill fix: `cv2.findContours(..., cv2.RETR_LIST, ...)` on a
+    RING-shaped icon (thin outline, hollow interior — see the fill-check
+    docstring above) returns TWO nested contours for the one ring — the
+    outer edge and the inner edge of the stroke — and both now pass every
+    filter (hull-based fill fixed exactly so this class of icon would stop
+    being rejected). Without this step, one physical ring icon on the
+    diagram would silently become TWO IconCandidates at nearly the same
+    bbox, and downstream two DiagramNodes / two classified resources for
+    what a human looking at the diagram sees as one ALB. Greedy IOU-based
+    suppression: sort by area descending (keep the OUTER contour, whose
+    bbox better captures the icon's true visual extent for phash matching),
+    drop anything overlapping an already-kept box past `iou_threshold`.
+    """
+    def _iou(a: IconCandidate, b: IconCandidate) -> float:
+        ax1, ay1, ax2, ay2 = a.bbox.x, a.bbox.y, a.bbox.x + a.bbox.width, a.bbox.y + a.bbox.height
+        bx1, by1, bx2, by2 = b.bbox.x, b.bbox.y, b.bbox.x + b.bbox.width, b.bbox.y + b.bbox.height
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inter = (ix2 - ix1) * (iy2 - iy1)
+        area_a = a.bbox.width * a.bbox.height
+        area_b = b.bbox.width * b.bbox.height
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    ordered = sorted(candidates, key=lambda c: c.bbox.width * c.bbox.height, reverse=True)
+    kept: list[IconCandidate] = []
+    for cand in ordered:
+        if any(_iou(cand, k) > iou_threshold for k in kept):
+            continue
+        kept.append(cand)
+    return kept
