@@ -64,12 +64,9 @@ from app.core.storage import read_upload
 log = logging.getLogger(__name__)
 
 # arch2terraform package (see arch2terraform_bridge.py for the parsing-side
-# integration point — same relative-path pattern reused here since this
-# module lives at the same depth: github(0)/services(1)/app(2)/backend(3)/
-# arch2tf-product(4)/thesis(5)).
-_ARCH2TF_SRC = Path(__file__).resolve().parents[5] / "arch2terraform" / "src"
-if str(_ARCH2TF_SRC) not in sys.path:
-    sys.path.insert(0, str(_ARCH2TF_SRC))
+# integration point)
+from app._pathboot import ensure_paths
+ensure_paths()
 from arch2terraform.differ.diagram_differ import DiagramDiff, diff_diagram_files
 from app.services.github.workflow_generator import generate_terraform_workflow
 

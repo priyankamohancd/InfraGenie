@@ -29,11 +29,8 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 # ── Path setup ────────────────────────────────────────────────────────────────
-_ARCH2TF_SRC = Path(__file__).resolve().parents[5] / "arch2terraform" / "src"
-if str(_ARCH2TF_SRC) not in sys.path:
-    sys.path.insert(0, str(_ARCH2TF_SRC))
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from app._pathboot import ensure_paths
+ensure_paths()
 
 from shared.schemas.models import DiagramFormat, ParsedConnection, ParsedDiagram, ParsedResource
 

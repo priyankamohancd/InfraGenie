@@ -40,12 +40,8 @@ from pathlib import Path
 
 import yaml
 
-# services/parser/missing_info_detector.py -> parser(0)/services(1)/app(2)/
-# backend(3)/arch2tf-product(4). Was parents[5] (one level too far, lands on
-# "thesis" instead of "arch2tf-product") — a pre-existing bug that made
-# `from shared...` unresolvable whenever nothing else had already imported
-# `shared` first.
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from app._pathboot import ensure_paths
+ensure_paths()
 from shared.schemas.models import (
     ParsedDiagram, ParsedResource, ClarificationField, ClarificationRequest,
     ClarificationAnswer,
@@ -57,11 +53,7 @@ from app.core.config import get_settings
 # index of which property keys are genuine catalog `default_attributes`
 # ("real config knobs") vs. incidental properties (wiring-set references,
 # tags, etc.) that shouldn't be surfaced as questions even under "ask
-# everything." Same parents[5]-reaches-thesis-root path pattern as
-# arch2terraform_bridge.py.
-_ARCH2TF_SRC = Path(__file__).resolve().parents[5] / "arch2terraform" / "src"
-if str(_ARCH2TF_SRC) not in sys.path:
-    sys.path.insert(0, str(_ARCH2TF_SRC))
+# everything."
 from arch2terraform.classifier.catalog import CATALOG as _A2TF_CATALOG
 
 _CATALOG_DEFAULT_KEYS: dict[str, set[str]] = {

@@ -10,7 +10,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from app._pathboot import ensure_paths
+ensure_paths()
 
 from app.core.config import get_settings
 from app.api.routes.pipeline import router as pipeline_router

@@ -25,10 +25,8 @@ import yaml
 from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
 
-# api/routes/pipeline.py -> routes(0)/api(1)/app(2)/backend(3)/
-# arch2tf-product(4). Was parents[5] (one level too far, lands on "thesis") —
-# pre-existing bug, same class as missing_info_detector.py's.
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from app._pathboot import ensure_paths
+ensure_paths()
 from shared.schemas.models import (
     Job, JobStatus, ClarificationResponse, JobStatusResponse,
     UploadResponse, JOB_PROGRESS, STAGE_LABELS, DiagramFormat,

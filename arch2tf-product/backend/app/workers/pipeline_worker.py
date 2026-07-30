@@ -16,10 +16,8 @@ import sys
 
 log = logging.getLogger(__name__)
 
-# app/workers/pipeline_worker.py -> workers(0)/app(1)/backend(2)/
-# arch2tf-product(3). Was parents[4] (one level too far, lands on "thesis") —
-# pre-existing bug, same class as missing_info_detector.py's.
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from app._pathboot import ensure_paths
+ensure_paths()
 from shared.schemas.models import Job, JobStatus
 
 from app.core.job_store import save_job, get_job, update_status

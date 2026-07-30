@@ -4,6 +4,8 @@
 *.tfstate.backup
 .terraform/
 .terraform.lock.hcl
+*.pem
+*.ppk
 
 # Python
 __pycache__/

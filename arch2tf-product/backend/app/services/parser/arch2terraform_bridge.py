@@ -44,14 +44,8 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 # ── Path setup ──────────────────────────────────────────────────────────────
-# arch2terraform package lives two levels above arch2tf-product/
-_ARCH2TF_SRC = Path(__file__).resolve().parents[5] / "arch2terraform" / "src"
-if str(_ARCH2TF_SRC) not in sys.path:
-    sys.path.insert(0, str(_ARCH2TF_SRC))
-
-_PRODUCT_ROOT = Path(__file__).resolve().parents[4]
-if str(_PRODUCT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PRODUCT_ROOT))
+from app._pathboot import ensure_paths
+ensure_paths()
 
 from arch2terraform.adapters.registry import parse_diagram as _a2tf_parse_diagram
 from arch2terraform.classifier.classifier import classify_diagram as _a2tf_classify_diagram

@@ -44,10 +44,8 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-import sys
-# services/apply/apply_runner.py -> apply(0)/services(1)/app(2)/backend(3)/
-# arch2tf-product(4) — same sys.path convention as tf_validator.py/packager.py.
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from app._pathboot import ensure_paths
+ensure_paths()
 from shared.schemas.models import ApplyStatus, BlockedVariable, DriftStatus, Job, TerraformPlan
 from app.core.config import get_settings
 from app.core.job_store import get_job, save_job

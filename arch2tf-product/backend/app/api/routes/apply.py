@@ -22,7 +22,8 @@ import sys
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from app._pathboot import ensure_paths
+ensure_paths()
 from shared.schemas.models import (
     ApplyStatus, ApplyPlanResponse, ApplyConfirmRequest, ApplyResolveRequest,
     ApplyStatusResponse, DriftCheckResponse,

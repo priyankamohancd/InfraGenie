@@ -46,11 +46,8 @@ import logging
 import sys
 from pathlib import Path
 
-# services/parser/state_reconciler.py -> parser(0)/services(1)/app(2)/
-# backend(3)/arch2tf-product(4) — same sys.path convention as
-# missing_info_detector.py's, needed for `from shared...` to resolve
-# whenever nothing else has already imported `shared` first.
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from app._pathboot import ensure_paths
+ensure_paths()
 from shared.schemas.models import ParsedResource
 
 log = logging.getLogger(__name__)

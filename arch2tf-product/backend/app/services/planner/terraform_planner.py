@@ -28,20 +28,14 @@ log = logging.getLogger(__name__)
 
 from app.core.config import get_settings
 
-# Shared schemas
-# services/planner/terraform_planner.py -> planner(0)/services(1)/app(2)/
-# backend(3)/arch2tf-product(4). Was parents[5] (one level too far, lands on
-# "thesis") — a pre-existing bug, same class as missing_info_detector.py's.
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from app._pathboot import ensure_paths
+ensure_paths()
 from shared.schemas.models import (
     ParsedDiagram, ParsedResource, ParsedConnection, TerraformPlan, TerraformModule
 )
 
 # arch2terraform package (see arch2terraform_bridge.py for the parsing-side
 # integration point — this is the generation-side one)
-_ARCH2TF_SRC = Path(__file__).resolve().parents[5] / "arch2terraform" / "src"
-if str(_ARCH2TF_SRC) not in sys.path:
-    sys.path.insert(0, str(_ARCH2TF_SRC))
 from arch2terraform.generator.hcl_format import resource_block as _a2tf_resource_block
 
 # Same source of truth the clarification UI uses (missing_info_detector.py) —
