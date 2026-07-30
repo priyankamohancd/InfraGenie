@@ -126,6 +126,12 @@ around a cluster of microservice icons, a "tier" label, a region label) that is 
 provisionable AWS resource — do not guess a container type for these, mark them "group" with \
 service_name null instead.
 - "type": "icon" for every individual AWS service icon (EC2, RDS, Lambda, S3, ALB, WAF, EKS, etc).
+- Do NOT include arrows/connecting lines or their text captions as elements (e.g. a label like \
+"Read/Edit", "Publish", "Outbound to Internet", "HTTPS" sitting next to or along an arrow between \
+two icons). Those describe a CONNECTION between two elements, not an element themselves — they are \
+detected separately. Only include a piece of text as its own element if it labels an actual icon or \
+boundary box (i.e. sits inside or immediately identifies a drawn icon/box), never when it merely \
+annotates an arrow.
 - bbox coordinates MUST be actual pixel coordinates within the stated {width}x{height} image, not \
 normalized/relative values.
 - parent_id must reference another element's "id" in this same list (the smallest/innermost \
