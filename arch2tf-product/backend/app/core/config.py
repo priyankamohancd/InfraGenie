@@ -104,6 +104,18 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        # pydantic-settings defaults to rejecting any .env key that isn't a
+        # declared field above ("extra_forbidden"). .env is shared as one
+        # env_file across the whole api container — arch2terraform's own
+        # vision-LLM toggle (ANTHROPIC_API_KEY, ARCH2TERRAFORM_USE_VISION_LLM,
+        # ARCH2TERRAFORM_VISION_LLM_MODEL — see image_adapter.py, which reads
+        # them directly via os.environ, deliberately independent of this
+        # Settings class) lives in the same file and crashed startup outright
+        # the first time it was set (2026-07-30). Those vars intentionally
+        # don't belong as fields here — they're arch2terraform's concern, not
+        # this app's — so this app's Settings should simply ignore whatever
+        # it doesn't recognize rather than fail closed on it.
+        extra = "ignore"
 
 
 @lru_cache()
