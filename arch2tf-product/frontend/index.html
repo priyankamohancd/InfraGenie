@@ -1044,8 +1044,25 @@ async function startUpload() {
   try {
     const resp = await fetch(`${API}/api/v1/upload`, { method: 'POST', body: formData });
     if (!resp.ok) {
-      const err = await resp.json();
-      showProcessError(err.detail || 'Upload failed');
+      // The backend always returns a JSON {detail: "..."} error body, but
+      // nginx's own error pages (413 over the client_max_body_size limit,
+      // 502/504 if the backend is unreachable, etc.) are plain text — if
+      // resp.json() were called unconditionally here and threw on one of
+      // those, it would land in the outer catch below and get reported as
+      // a generic "Cannot connect to backend", masking the real cause
+      // (confirmed 2026-07-30: a real diagram upload hit nginx's default
+      // 1MB limit and showed exactly that misleading message instead of
+      // the actual 413).
+      let detail = `Upload failed (HTTP ${resp.status})`;
+      try {
+        const err = await resp.json();
+        detail = err.detail || detail;
+      } catch {
+        detail = resp.status === 413
+          ? 'File too large for the server to accept. Try a smaller diagram export.'
+          : `Upload failed (HTTP ${resp.status} ${resp.statusText})`;
+      }
+      showProcessError(detail);
       return;
     }
     const data = await resp.json();
