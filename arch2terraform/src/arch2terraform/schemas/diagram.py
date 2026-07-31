@@ -69,7 +69,15 @@ class DiagramNode:
     fill_color: str | None = None
     parent_id: str | None = None     # explicit parent from the format (e.g. draw.io group/container)
     source_format: str = "unknown"
-    extra: dict = field(default_factory=dict)  # format-specific leftovers, never read downstream
+    # Format-specific leftovers. Mostly opaque to downstream code, with one
+    # deliberate exception (added 2026-07-31): vision_llm_detector.py sets
+    # extra["terraform_type_hint"] to the LLM's own best-guess Terraform
+    # resource type (chosen from the real catalog, using diagram context a
+    # plain icon/label keyword match can't see) — classifier.py's
+    # _classify_node() reads and trusts this key specifically when it names
+    # a real catalog type, falling back to keyword matching otherwise. See
+    # vision_llm_detector.py's module docstring.
+    extra: dict = field(default_factory=dict)
     # Native custom-data metadata attached to the shape in the diagramming
     # tool itself — draw.io's "Edit Data" (serialized as an <object>/
     # <UserObject> wrapper around the <mxCell>), Excalidraw's per-element

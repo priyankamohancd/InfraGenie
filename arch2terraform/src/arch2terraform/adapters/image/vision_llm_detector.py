@@ -61,6 +61,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from arch2terraform.classifier.catalog import CATALOG
 from arch2terraform.schemas.diagram import (
     BoundingBox,
     DiagramEdge,
@@ -68,6 +69,13 @@ from arch2terraform.schemas.diagram import (
     NodeShape,
     ParsedDiagram,
 )
+
+# Every real Terraform type the classifier knows how to emit, with its
+# label_keywords joined in as a short human-readable hint (so the model
+# isn't just guessing from a bare resource-type string) — passed into the
+# prompt below. Building this from CATALOG directly (not a hand-maintained
+# copy) means it can never drift out of sync as catalog.py grows.
+_VALID_TERRAFORM_TYPES = frozenset(d.terraform_type for d in CATALOG)
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +103,22 @@ class VisionLLMError(RuntimeError):
 # Prompt construction
 # ---------------------------------------------------------------------------
 
+def _terraform_type_catalog_text() -> str:
+    """One line per catalog type: 'aws_eks_node_group (eks node, node group, eks worker, worker node)'
+    — gives the model the REAL, exact identifiers it must choose from (not
+    free text it invents), plus enough of each type's own label vocabulary
+    to disambiguate close calls (e.g. cluster vs. node group) using the
+    diagram's actual label text and surrounding context, which a downstream
+    substring match over the label alone can't see."""
+    lines = []
+    for d in CATALOG:
+        keywords = ", ".join(d.label_keywords) if d.label_keywords else ""
+        lines.append(f"- {d.terraform_type} ({keywords})" if keywords else f"- {d.terraform_type}")
+    return "\n".join(lines)
+
+
 def _build_prompt(width: int, height: int) -> str:
+    catalog_text = _terraform_type_catalog_text()
     return f"""You are analyzing an AWS architecture diagram that is exactly {width}x{height} pixels \
 (origin (0,0) at the top-left corner, x increases rightward, y increases downward).
 
@@ -111,6 +134,7 @@ Return ONLY a single JSON object (no markdown fences, no prose before or after) 
       "id": "e1",
       "type": "container" | "icon" | "group",
       "service_name": "<best-guess AWS service or boundary name, e.g. 'Amazon EC2', 'VPC', 'Public Subnet', 'Security Group', null if type is 'group'>",
+      "terraform_type_hint": "<the single closest matching Terraform resource type from the list below, using BOTH the icon and the label/surrounding context to disambiguate — e.g. a node labeled 'EKS Node 1' or 'Worker Node' next to an EKS cluster is aws_eks_node_group, NOT aws_eks_cluster. null if you are not confident enough to commit to one, or if type is 'group'>",
       "label": "<any visible text label/caption near or inside this element, verbatim, empty string if none>",
       "bbox": {{"x": <int>, "y": <int>, "width": <int>, "height": <int>}},
       "parent_id": "<id of the immediately enclosing container/group element, or null if top-level>",
@@ -118,6 +142,10 @@ Return ONLY a single JSON object (no markdown fences, no prose before or after) 
     }}
   ]
 }}
+
+Valid values for "terraform_type_hint" (must be copied EXACTLY as written here, or null — never invent \
+a new one, never guess a plausible-looking name that isn't in this list):
+{catalog_text}
 
 Rules:
 - "type": "container" for a box that represents a REAL AWS network resource (VPC, Subnet, \
@@ -298,6 +326,21 @@ def _parse_response(data: dict) -> tuple[list[DiagramNode], list[str]]:
         except (TypeError, ValueError):
             confidence = None
 
+        # Validated here (not left to classifier.py alone) so a
+        # hallucinated/misspelled type name never even reaches
+        # extra["terraform_type_hint"] — classifier.py's own check is a
+        # second, defensive layer, not the only one.
+        type_hint_raw = el.get("terraform_type_hint")
+        type_hint = str(type_hint_raw).strip() if type_hint_raw else None
+        if el_type == "group":
+            type_hint = None  # a group is never a provisionable resource — see service_name handling above
+        if type_hint and type_hint not in _VALID_TERRAFORM_TYPES:
+            warnings.append(
+                f"Element {local_id!r} — ignoring invalid terraform_type_hint {type_hint!r} "
+                "(not a real catalog type); falling back to icon/label matching for it"
+            )
+            type_hint = None
+
         nodes.append(
             DiagramNode(
                 id=real_id,
@@ -307,7 +350,12 @@ def _parse_response(data: dict) -> tuple[list[DiagramNode], list[str]]:
                 image_ref=service_name,
                 parent_id=parent_id,
                 source_format="image",
-                extra={"stage": "vision_llm", "vision_confidence": confidence, "vision_type": el_type},
+                extra={
+                    "stage": "vision_llm",
+                    "vision_confidence": confidence,
+                    "vision_type": el_type,
+                    "terraform_type_hint": type_hint,
+                },
             )
         )
 

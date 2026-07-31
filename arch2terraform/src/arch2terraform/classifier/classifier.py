@@ -377,6 +377,21 @@ def classify_diagram(diagram: ParsedDiagram) -> tuple[list[ClassifiedResource], 
 
 
 def _classify_node(node: DiagramNode) -> tuple[ResourceDefinition, float, dict] | None:
+    # Added 2026-07-31: when the Vision-LLM adapter ran (see
+    # vision_llm_detector.py), it has already read this node's label AND its
+    # surrounding diagram context (what it's nested in, what's around it) —
+    # real semantic disambiguation that plain icon/label substring matching
+    # below can't do (the exact class of bug this fixes: "EKS Node 1 (t2
+    # medium)" matching aws_eks_cluster purely because "eks" is a substring
+    # of both). Only trusted when it names a REAL catalog type — a
+    # hallucinated or invalid hint falls straight through to the icon/label
+    # matching below rather than being trusted blindly.
+    vision_hint = (node.extra or {}).get("terraform_type_hint")
+    if vision_hint:
+        hint_match = next((d for d in CATALOG if d.terraform_type == vision_hint), None)
+        if hint_match:
+            return hint_match, _ICON_MATCH_CONFIDENCE, {}
+
     icon_match = _match_by_icon(node)
     if icon_match:
         return icon_match, _ICON_MATCH_CONFIDENCE, {}
