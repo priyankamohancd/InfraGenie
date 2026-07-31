@@ -177,6 +177,37 @@ _NEVER_ASK_CATALOG_DEFAULTS = frozenset({
 })
 
 
+def _looks_like_wired_reference(value) -> bool:
+    """True if `value` is already a real Terraform reference wired by the
+    classifier/planner (e.g. an auto-generated IAM role's arn for an EKS
+    cluster's role_arn — see arch2terraform's classifier.py
+    _build_eks_cluster_companion_blocks() — or a list of sibling subnet ids
+    for an ALB's subnets — see _wire_lb_subnets()) rather than a literal
+    value or catalog placeholder.
+
+    Added 2026-07-31 per her explicit request: "for these kind of
+    dependencies, its not possible to pass the id values beforehand, these
+    should be carried out in outputs ... the model should be smart enough to
+    ... create a new role" — once a field is auto-wired to a real resource
+    reference, asking the user for it on the Clarify screen would just let a
+    literal placeholder answer overwrite a value that's already correct.
+    Mirrors arch2terraform's hcl_format.hcl_value() reference-detection rule
+    (var./data./aws_*.NAME/random_*.NAME) so this stays in lockstep with
+    whatever the generator itself treats as an unquoted reference, rather
+    than maintaining a second, driftable definition of "looks like a wire."
+    """
+    def _is_ref_str(s) -> bool:
+        return isinstance(s, str) and (
+            s.startswith("var.")
+            or s.startswith("data.")
+            or (s.startswith(("aws_", "random_")) and "." in s)
+        )
+
+    if isinstance(value, list):
+        return bool(value) and all(_is_ref_str(v) for v in value)
+    return _is_ref_str(value)
+
+
 def _looks_like_placeholder(value) -> bool:
     """True if `value` is empty, an old-style '# TODO' comment, or matches
     one of arch2terraform's catalog placeholder conventions — i.e. a value
@@ -323,6 +354,8 @@ def detect_missing_info(
         for prop_key, prop_val in resource.properties.items():
             if prop_key in already_asked or prop_key.startswith("_"):
                 continue  # covered by the bespoke question above already
+            if _looks_like_wired_reference(prop_val):
+                continue  # already auto-wired to a real resource reference — nothing to ask
             is_catalog_default = (
                 prop_key in catalog_default_keys
                 and prop_key not in _NEVER_ASK_CATALOG_DEFAULTS
