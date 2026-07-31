@@ -93,66 +93,21 @@ def _build_mq_broker_companion_blocks(terraform_name: str) -> tuple[list[str], s
 # they're emitted as companion blocks rather than inline attributes.
 _S3_BUCKET_TYPE = "aws_s3_bucket"
 
-# Added 2026-07-31 per her explicit request: "for these kind of dependencies
-# ... the model should be smart enough to analyse the architecture diagram
-# and create a new role" — an EKS cluster's `role_arn` is not a diagram-
-# derived permission set the way security_engine's edge-driven IAM roles are
-# (see complete_security_orchestrator.py's IAM_ROLE_ELIGIBLE_TYPES /
-# dynamic_iam_generator.py — both strictly derive policies from a compute
-# node's OUTBOUND EDGES, and would return zero policies for an EKS cluster
-# node with no direct outbound edges of its own). Every EKS cluster needs
-# this control-plane service role unconditionally, regardless of what it
-# connects to in the diagram — structurally the same "always emit a real
-# companion resource instead of asking the user for one" case as the MQ
-# broker's password above, just for an IAM role instead of a secret.
-_EKS_CLUSTER_TYPE = "aws_eks_cluster"
-
-
-def _build_eks_cluster_companion_blocks(terraform_name: str) -> tuple[list[str], str]:
-    """
-    Returns (companion HCL resource blocks, role ARN reference to use in
-    place of the catalog's placeholder ARN in the cluster's `role_arn`
-    attribute).
-
-    Generates a real aws_iam_role with the EKS control-plane trust policy
-    (principal: eks.amazonaws.com) plus the AWS-managed AmazonEKSClusterPolicy
-    attachment — the minimum AWS itself requires to create the cluster at
-    all. Named off the cluster's own terraform_name so multiple EKS clusters
-    in one diagram don't collide.
-    """
-    role_name = f"{terraform_name}_cluster_role"
-    attachment_name = f"{terraform_name}_cluster_policy"
-
-    role_block = (
-        f'# Auto-generated: every aws_eks_cluster needs a control-plane\n'
-        f'# service role — this is not derived from the diagram\'s edges (an\n'
-        f'# EKS cluster doesn\'t "connect out" to anything itself), so it is\n'
-        f'# always generated rather than asked for.\n'
-        f'resource "aws_iam_role" "{role_name}" {{\n'
-        f'  name = "{terraform_name}-cluster-role"\n'
-        f'\n'
-        f'  assume_role_policy = jsonencode({{\n'
-        f'    Version = "2012-10-17"\n'
-        f'    Statement = [\n'
-        f'      {{\n'
-        f'        Effect    = "Allow"\n'
-        f'        Principal = {{ Service = "eks.amazonaws.com" }}\n'
-        f'        Action    = "sts:AssumeRole"\n'
-        f'      }}\n'
-        f'    ]\n'
-        f'  }})\n'
-        f'}}'
-    )
-
-    attachment_block = (
-        f'resource "aws_iam_role_policy_attachment" "{attachment_name}" {{\n'
-        f'  role       = aws_iam_role.{role_name}.name\n'
-        f'  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"\n'
-        f'}}'
-    )
-
-    role_arn_ref = f"aws_iam_role.{role_name}.arn"
-    return [role_block, attachment_block], role_arn_ref
+# NOTE 2026-07-31: an earlier version of this file generated a companion
+# aws_iam_role here, per-node, specifically for aws_eks_cluster. Superseded
+# same day per her explicit follow-up — "this shouldn't happen just in case
+# of eks, but whenever any resource requires a role then they should just be
+# created by analysing the resource's connections with other resources":
+# role generation now goes through the SAME edge-driven engine every other
+# compute resource's role already goes through
+# (app/services/security_engine/ — see complete_security_orchestrator.py's
+# MANDATORY_ROLE_TYPES and dynamic_iam_generator.py's
+# _MANDATORY_MANAGED_POLICY_ARNS in arch2tf-product/backend) instead of a
+# one-off, per-type special case living here in the classifier. Doing it
+# there instead of here also means it runs against the WHOLE diagram graph
+# (all nodes + edges), not just this one node in isolation — required for
+# "analyse the resource's connections with other resources" to mean
+# anything at all.
 
 
 # Wires aws_lb.subnets to every aws_subnet resource actually present in the
@@ -174,6 +129,29 @@ def _wire_lb_subnets(classified: list[ClassifiedResource]) -> None:
     for r in classified:
         if r.resource_type == "aws_lb":
             r.attributes["subnets"] = subnet_refs
+
+
+# Same sibling-reference idea as _wire_lb_subnets, for aws_eks_node_group's
+# cluster_name and subnet_ids — neither is a containment relationship (a
+# node group isn't drawn "inside" its cluster). Only wires cluster_name when
+# there's exactly ONE aws_eks_cluster in the diagram: with zero, there's
+# nothing to reference; with more than one, which cluster a given node group
+# belongs to is genuinely ambiguous from diagram structure alone (no edge
+# convention exists yet to disambiguate), so the catalog placeholder is left
+# in place for the user to wire by hand rather than guessing wrong.
+def _wire_eks_node_group_refs(classified: list[ClassifiedResource]) -> None:
+    subnet_refs = [
+        f"aws_subnet.{r.terraform_name}.id" for r in classified if r.resource_type == "aws_subnet"
+    ]
+    clusters = [r for r in classified if r.resource_type == "aws_eks_cluster"]
+
+    for r in classified:
+        if r.resource_type != "aws_eks_node_group":
+            continue
+        if subnet_refs:
+            r.attributes["subnet_ids"] = subnet_refs
+        if len(clusters) == 1:
+            r.attributes["cluster_name"] = f"aws_eks_cluster.{clusters[0].terraform_name}.name"
 
 
 def _build_s3_bucket_companion_blocks(terraform_name: str) -> list[str]:
@@ -377,11 +355,6 @@ def classify_diagram(diagram: ParsedDiagram) -> tuple[list[ClassifiedResource], 
         attributes = dict(definition.default_attributes)
         attributes.update(attribute_overrides)
 
-        if definition.terraform_type == _EKS_CLUSTER_TYPE:
-            eks_role_blocks, role_arn_ref = _build_eks_cluster_companion_blocks(tf_name)
-            companion_blocks = companion_blocks + eks_role_blocks
-            attributes["role_arn"] = role_arn_ref
-
         classified.append(
             ClassifiedResource(
                 node_id=node.id,
@@ -399,6 +372,7 @@ def classify_diagram(diagram: ParsedDiagram) -> tuple[list[ClassifiedResource], 
         )
 
     _wire_lb_subnets(classified)
+    _wire_eks_node_group_refs(classified)
     return classified, unclassified
 
 

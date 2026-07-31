@@ -465,6 +465,39 @@ class DynamicIAMPolicyGenerator:
         }
 
 
+# AWS-managed policy ARNs that a resource type needs attached to its
+# generated role regardless of what the diagram's edges imply — the
+# baseline permissions AWS itself requires the service to function at all,
+# as opposed to the edge-derived custom policies above (which express what
+# the diagram says THIS specific role should additionally be allowed to
+# call). Added 2026-07-31 generalizing a fix originally scoped to just
+# aws_eks_cluster (her explicit follow-up: "this shouldn't happen just in
+# case of eks ... whenever any resource requires a role then they should
+# just be created") — every entry here is a real, AWS-documented minimum
+# requirement for that resource type to be created/operate at all, not a
+# guessed convenience default. Deliberately conservative: only add an entry
+# here when there's one unambiguous AWS-managed policy that's genuinely
+# mandatory (matches the same bar catalog.py's default_attributes uses for
+# "safe to bake in without asking") — MWAA/CodePipeline/CodeBuild/Glue are
+# still made IAM_ROLE_ELIGIBLE (see complete_security_orchestrator.py) so
+# they get a real role + trust policy + any edge-derived policies, but no
+# entry is added here for them since their real IAM requirements are
+# genuinely diagram/config-dependent (e.g. CodeBuild's service role depends
+# entirely on what it builds) rather than one fixed managed policy.
+MANDATORY_MANAGED_POLICY_ARNS: Dict[str, List[str]] = {
+    "aws_eks_cluster": ["arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"],
+    # An EKS worker node needs these three unconditionally to function at
+    # all (join the cluster, run the CNI plugin, pull container images) —
+    # not diagram/edge-dependent, same "real AWS-documented minimum"
+    # standard as the cluster's own policy above.
+    "aws_eks_node_group": [
+        "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
+        "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
+        "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
+    ],
+}
+
+
 class UniversalPolicyBuilder:
     """
     Build complete IAM role with policies for ANY architecture
@@ -477,9 +510,15 @@ class UniversalPolicyBuilder:
                                                edges: List[Dict],
                                                all_nodes: Dict) -> Dict:
         """
-        Generate all policies for a compute resource (EC2, Lambda, etc.)
+        Generate all policies for a compute/service resource (EC2, Lambda,
+        EKS cluster, Glue job, etc.)
 
-        Works with ANY number of outbound connections
+        Works with ANY number of outbound connections — including zero, for
+        resource types AWS requires a role for unconditionally (see
+        MANDATORY_MANAGED_POLICY_ARNS and
+        complete_security_orchestrator.MANDATORY_ROLE_TYPES), where the role
+        still needs to exist even with no diagram-derived permissions to add
+        to it.
         """
         compute_label = compute_node.get('label', '')
         compute_type = compute_node.get('type', '')
@@ -505,11 +544,14 @@ class UniversalPolicyBuilder:
             if policy:
                 policies.append(policy)
 
+        managed_policy_arns = list(MANDATORY_MANAGED_POLICY_ARNS.get(compute_type, []))
+
         return {
             "role_name": role_name,
             "service_principal": self._get_service_principal(compute_type),
             "policies": policies,
-            "resource_count": len(policies)
+            "managed_policy_arns": managed_policy_arns,
+            "resource_count": len(policies),
         }
 
     def _get_service_principal(self, resource_type: str) -> str:
@@ -519,7 +561,20 @@ class UniversalPolicyBuilder:
             "aws_lambda_function": "lambda.amazonaws.com",
             "aws_ecs_task_definition": "ecs-tasks.amazonaws.com",
             "aws_batch_job_definition": "batch.amazonaws.com",
-            "aws_states_state_machine": "states.amazonaws.com",
+            # Was "aws_states_state_machine" — a real, previously-silent bug
+            # (found 2026-07-31): the actual Terraform/AWS provider resource
+            # type is aws_sfn_state_machine (see arch2terraform's catalog.py
+            # and complete_security_orchestrator.IAM_ROLE_ELIGIBLE_TYPES,
+            # both of which already use the correct name) — this dict's key
+            # never matched, so every Step Functions role silently fell back
+            # to "ec2.amazonaws.com" below instead of "states.amazonaws.com".
+            "aws_sfn_state_machine": "states.amazonaws.com",
+            "aws_eks_cluster": "eks.amazonaws.com",
+            "aws_eks_node_group": "ec2.amazonaws.com",
+            "aws_mwaa_environment": "airflow.amazonaws.com",
+            "aws_codepipeline": "codepipeline.amazonaws.com",
+            "aws_codebuild_project": "codebuild.amazonaws.com",
+            "aws_glue_job": "glue.amazonaws.com",
         }
         return service_principals.get(resource_type, "ec2.amazonaws.com")
 

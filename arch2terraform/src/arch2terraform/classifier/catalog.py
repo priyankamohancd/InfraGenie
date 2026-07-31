@@ -181,6 +181,40 @@ CATALOG: list[ResourceDefinition] = [
                                 "subnet_ids": ["subnet-00000000000000000", "subnet-00000000000000001"],
                             }],
                         }),
+    # Added 2026-07-31: real bug found on an actual EKS diagram — worker-node
+    # boxes labeled things like "EKS Node 1 (t2 medium)" were matching
+    # aws_eks_cluster above by label (its keywords "eks"/"kubernetes" are
+    # both substrings of "EKS Node..."), so every worker node in the diagram
+    # was being classified as its OWN separate EKS cluster instead of a node
+    # group belonging to the one real cluster. This entry's label_keywords
+    # are deliberately longer/more specific ("eks node", "node group", ...)
+    # so classifier.py's "longest matched key wins" tie-break (see
+    # _match_by_label) picks this over the bare "eks"/"kubernetes" match.
+    # cluster_name/subnet_ids are required flat arguments with no
+    # containment analogue (a node group isn't drawn "inside" its cluster
+    # the way a subnet sits inside a VPC) — wired via the same
+    # sibling-reference pass as aws_lb's subnets, see
+    # _wire_eks_node_group_refs(). node_role_arn and scaling_config
+    # (desired_size/max_size/min_size) are also required; node_role_arn
+    # feeds the same MANDATORY_ROLE_TYPES machinery as the cluster's own
+    # role_arn (see security_engine's complete_security_orchestrator.py in
+    # arch2tf-product), just with the worker-node service principal and
+    # managed policies (ec2.amazonaws.com + AmazonEKSWorkerNodePolicy /
+    # AmazonEKS_CNI_Policy / AmazonEC2ContainerRegistryReadOnly) instead of
+    # the cluster's eks.amazonaws.com + AmazonEKSClusterPolicy.
+    ResourceDefinition(
+        "aws_eks_node_group",
+        ("eksnodegroup", "nodegroup", "eksworkernode"),
+        ("eks node", "node group", "eks worker", "worker node"),
+        default_attributes={
+            "cluster_name": "replace-with-cluster-name",
+            "node_role_arn": _FAKE_IAM_ROLE_ARN,
+            "subnet_ids": ["subnet-00000000000000000", "subnet-00000000000000001"],
+        },
+        nested_blocks={
+            "scaling_config": [{"desired_size": 2, "max_size": 3, "min_size": 1}],
+        },
+    ),
     # name, state, priority are required flat arguments. compute_environment_order is
     # ALSO required and is a nested block (at least one entry) — now emitted via
     # nested_blocks.

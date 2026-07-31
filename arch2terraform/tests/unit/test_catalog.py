@@ -54,6 +54,7 @@ _REQUIRED_FLAT_ARGS: dict[str, set[str]] = {
     # (2026-07) caught that `name` was missing — the original audit only recorded
     # role_arn since this type was already flagged block-incomplete.
     "aws_eks_cluster": {"name", "role_arn"},  # vpc_config block — see _REQUIRED_NESTED_BLOCKS
+    "aws_eks_node_group": {"cluster_name", "node_role_arn", "subnet_ids"},  # scaling_config block — see _REQUIRED_NESTED_BLOCKS
     "aws_batch_job_queue": {"name", "state", "priority"},  # compute_environment_order — see _REQUIRED_NESTED_BLOCKS
     "aws_s3_bucket": {"bucket"},
     "aws_ebs_volume": {"availability_zone"},
@@ -119,6 +120,7 @@ _REQUIRED_FLAT_ARGS: dict[str, set[str]] = {
 _REQUIRED_NESTED_BLOCKS: dict[str, set[str]] = {
     "aws_autoscaling_group": {"launch_template"},
     "aws_eks_cluster": {"vpc_config"},
+    "aws_eks_node_group": {"scaling_config"},
     "aws_batch_job_queue": {"compute_environment_order"},
     "aws_waf_web_acl": {"default_action"},
     "aws_cloudfront_distribution": {"origin", "default_cache_behavior", "restrictions", "viewer_certificate"},

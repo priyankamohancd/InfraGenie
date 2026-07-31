@@ -78,6 +78,18 @@ ATTACHMENT_ATTR_BY_RESOURCE_TYPE: dict[str, tuple[str, str, str, str]] = {
     "aws_lambda_function": ("role", "aws_iam_role", "arn", ""),
     "aws_ecs_task_definition": ("execution_role_arn", "aws_iam_role", "arn", ""),
     "aws_sfn_state_machine": ("role_arn", "aws_iam_role", "arn", ""),
+    # Added 2026-07-31, generalizing the EKS-specific role fix to every
+    # resource type complete_security_orchestrator.MANDATORY_ROLE_TYPES now
+    # covers — mirrors that set exactly (mandatory role => needs the real
+    # generated role's arn wired onto the actual attribute this resource
+    # type's catalog entry requires it on). Attribute names match
+    # arch2terraform's catalog.py default_attributes keys for each type.
+    "aws_eks_cluster": ("role_arn", "aws_iam_role", "arn", ""),
+    "aws_eks_node_group": ("node_role_arn", "aws_iam_role", "arn", ""),
+    "aws_mwaa_environment": ("execution_role_arn", "aws_iam_role", "arn", ""),
+    "aws_codepipeline": ("role_arn", "aws_iam_role", "arn", ""),
+    "aws_codebuild_project": ("service_role", "aws_iam_role", "arn", ""),
+    "aws_glue_job": ("role_arn", "aws_iam_role", "arn", ""),
 }
 
 # Resource types security_group_generator.py (Theisis/implementation/security)

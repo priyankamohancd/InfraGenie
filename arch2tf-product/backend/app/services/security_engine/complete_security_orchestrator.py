@@ -55,16 +55,45 @@ class CompleteSecurityOrchestrator:
     6. Validate everything
     """
 
+    # Resource types whose catalog definition (arch2terraform's catalog.py)
+    # requires a role_arn/execution_role_arn/service_role flat argument with
+    # NO valid default — AWS itself won't create the resource without one,
+    # regardless of what (if anything) the diagram wires it to. These always
+    # get a role generated, even with zero qualifying outbound edges — see
+    # _generate_iam_policies below and dynamic_iam_generator's
+    # MANDATORY_MANAGED_POLICY_ARNS for the baseline permissions each of
+    # these needs beyond just an assume-role trust policy.
+    #
+    # Added 2026-07-31 (generalized from an EKS-only fix per her explicit
+    # follow-up: "this shouldn't happen just in case of eks, but whenever
+    # any resource requires a role then they should just be created by
+    # analysing the resource's connections with other resources"). Not
+    # included: aws_batch_job_definition's role_arn-equivalent isn't in
+    # arch2terraform's catalog yet (that resource type isn't classifiable
+    # from a diagram at all currently), so there's no real placeholder this
+    # fixes — left out rather than guessing at a shape that isn't real yet.
+    MANDATORY_ROLE_TYPES = {
+        "aws_eks_cluster",
+        "aws_eks_node_group",
+        "aws_mwaa_environment",
+        "aws_codepipeline",
+        "aws_codebuild_project",
+        "aws_glue_job",
+    }
+
     # Resource types that can actually assume an IAM role. Anything else
     # (ALB, RDS, S3, ...) never gets a role/policies generated for it, even
-    # if it happens to have outbound edges in the diagram.
+    # if it happens to have outbound edges in the diagram. Includes both the
+    # original edge-driven-only set (a role only appears if the diagram
+    # gives the resource qualifying outbound edges) and MANDATORY_ROLE_TYPES
+    # above (a role always appears, edges or not).
     IAM_ROLE_ELIGIBLE_TYPES = {
         "aws_instance",
         "aws_lambda_function",
         "aws_ecs_task_definition",
         "aws_batch_job_definition",
         "aws_sfn_state_machine",
-    }
+    } | MANDATORY_ROLE_TYPES
 
     def __init__(self, namespace: str = "default",
                  vpc_id: str = "var.vpc_id",
@@ -233,21 +262,29 @@ class CompleteSecurityOrchestrator:
         # never assumes a role or calls AWS APIs, so it must never get a
         # role/policy generated for it.
         for node_id, node in nodes.items():
-            if node.get('type') not in self.IAM_ROLE_ELIGIBLE_TYPES:
+            node_type = node.get('type')
+            if node_type not in self.IAM_ROLE_ELIGIBLE_TYPES:
                 continue
 
             result = self.iam_builder.generate_policies_for_compute_resource(
                 node, edges, nodes
             )
 
-            if result['resource_count'] > 0:
+            # MANDATORY_ROLE_TYPES always get a role even with zero
+            # edge-derived policies (AWS requires the role attribute to be
+            # set regardless of what the diagram wires the resource to) —
+            # everything else keeps the original "only if it actually has
+            # something to grant" behavior, so e.g. an EC2 instance with no
+            # outbound edges still gets no role/instance-profile noise.
+            if result['resource_count'] > 0 or node_type in self.MANDATORY_ROLE_TYPES:
                 iam_roles[result['role_name']] = {
                     'role_name': result['role_name'],
                     'service_principal': result['service_principal'],
                     'policies': result['policies'],
+                    'managed_policy_arns': result.get('managed_policy_arns', []),
                     'node_id': node_id,
                     'resource_label': node.get('label', node_id),
-                    'resource_type': node.get('type')
+                    'resource_type': node_type,
                 }
 
         return iam_roles
@@ -340,6 +377,19 @@ class CompleteSecurityOrchestrator:
             code += f'    }}]\n'
             code += f'  }})\n'
             code += f'}}\n\n'
+
+            # Mandatory AWS-managed policy attachments (e.g. EKS's required
+            # AmazonEKSClusterPolicy) — separate from the edge-derived
+            # inline policies below since these are fixed per-service
+            # baseline requirements, not something the diagram's
+            # connections determine. See dynamic_iam_generator's
+            # MANDATORY_MANAGED_POLICY_ARNS.
+            for i, policy_arn in enumerate(role_data.get('managed_policy_arns', []), start=1):
+                suffix = "" if i == 1 else f"_{i}"
+                code += f'resource "aws_iam_role_policy_attachment" "{role_tf_id}_managed{suffix}" {{\n'
+                code += f'  role       = aws_iam_role.{role_tf_id}.name\n'
+                code += f'  policy_arn = "{policy_arn}"\n'
+                code += f'}}\n\n'
 
             # Policies - each gets its own resource address (role_tf_id alone
             # would collide when a role has more than one policy, which
@@ -441,7 +491,10 @@ data "aws_region" "current" {
             warnings.append("⚠️  No IAM roles generated")
 
         for role_name, role_data in iam_roles.items():
-            if not role_data.get('policies'):
+            # A mandatory-role type (e.g. EKS) with no edge-derived policies
+            # but a real managed-policy attachment is expected, not a gap —
+            # only warn when the role has neither.
+            if not role_data.get('policies') and not role_data.get('managed_policy_arns'):
                 warnings.append(f"⚠️  Role '{role_name}' has no policies")
 
         # Validate resource linkings

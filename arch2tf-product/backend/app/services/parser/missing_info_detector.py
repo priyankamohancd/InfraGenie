@@ -176,6 +176,34 @@ _NEVER_ASK_CATALOG_DEFAULTS = frozenset({
     "manage_master_user_password", "manage_master_password", "username",
 })
 
+# Subset of security_bridge.ATTACHMENT_ATTR_BY_RESOURCE_TYPE covering only
+# complete_security_orchestrator.MANDATORY_ROLE_TYPES (not imported here —
+# importing security_bridge would pull in the whole security_engine/
+# sys.path bootstrap for one small dict; this module already duplicates
+# arch2terraform's containment-wiring rules the same way for the same
+# reason, see terraform_planner.py's _CONTAINMENT_WIRING_RULES comment).
+#
+# Deliberately NOT the full attachment map: build_terraform_plan's
+# _wire_role_attachments() (terraform_planner.py) overwrites a resource's
+# role attribute ONLY IF the security engine actually generated a role for
+# it, which for most eligible types (aws_lambda_function,
+# aws_ecs_task_definition, aws_sfn_state_machine) depends on the diagram
+# having qualifying outbound edges — unknowable at this Clarify-screen
+# step, so asking about those still gives the user a real fallback value if
+# no edges end up producing a role. MANDATORY_ROLE_TYPES is different: those
+# get a role unconditionally regardless of edges (see
+# complete_security_orchestrator.py), so the attribute is ALWAYS overwritten
+# later — asking here was always pure noise, which is exactly what
+# triggered her "what value is this asking for" / this whole follow-up.
+_MANDATORY_ROLE_WIRED_FIELD_BY_RESOURCE_TYPE = {
+    "aws_eks_cluster": "role_arn",
+    "aws_eks_node_group": "node_role_arn",
+    "aws_mwaa_environment": "execution_role_arn",
+    "aws_codepipeline": "role_arn",
+    "aws_codebuild_project": "service_role",
+    "aws_glue_job": "role_arn",
+}
+
 
 def _looks_like_wired_reference(value) -> bool:
     """True if `value` is already a real Terraform reference wired by the
@@ -356,6 +384,8 @@ def detect_missing_info(
                 continue  # covered by the bespoke question above already
             if _looks_like_wired_reference(prop_val):
                 continue  # already auto-wired to a real resource reference — nothing to ask
+            if _MANDATORY_ROLE_WIRED_FIELD_BY_RESOURCE_TYPE.get(resource.aws_resource_type) == prop_key:
+                continue  # always overwritten later by the security engine's generated role — nothing to ask
             is_catalog_default = (
                 prop_key in catalog_default_keys
                 and prop_key not in _NEVER_ASK_CATALOG_DEFAULTS
