@@ -360,6 +360,25 @@ class DynamicIAMPolicyGenerator:
         to_label = to_node.get('label', '')
         to_metadata = to_node.get('metadata', {})
         edge_label = edge.get('label', '')
+        # Vision-LLM's own semantic read of this connection (see
+        # security_bridge.py's _build_resource_graph) — "" for every edge
+        # from the classical (non-Vision-LLM) pipeline, in which case this
+        # falls through to the existing label-keyword inference exactly as
+        # before. Added 2026-07-31 per explicit follow-up: the model has
+        # actual diagram context (both endpoints, surrounding architecture)
+        # that a label-keyword match on the edge's own caption text alone
+        # can't see.
+        operation_hint = str(edge.get('operation_hint') or '').strip().lower()
+
+        # A model-confirmed "network" connection (plain traffic, not an
+        # AWS-API call) is a strictly better signal than NON_IAM_TARGET_TYPES
+        # below — it's a judgment about THIS specific connection using real
+        # context, not a blanket rule keyed only on the target's type. Still
+        # keep NON_IAM_TARGET_TYPES as the fallback for the classical
+        # pipeline (operation_hint == "" there) and as a defensive backstop
+        # even when Vision-LLM is enabled but didn't classify this edge.
+        if operation_hint == "network":
+            return None
 
         # Plain compute/network traffic (e.g. ALB -> EC2, EC2 -> EC2) is
         # handled by security groups, not IAM - skip silently rather than
@@ -372,8 +391,13 @@ class DynamicIAMPolicyGenerator:
         if not target_service:
             return self._handle_unknown_service(to_type, to_label, edge_label)
 
-        # Step 2: Infer operation type
-        operation = self.operation_inferencer.infer_operation(edge_label)
+        # Step 2: Infer operation type — prefer the model's own hint
+        # (read/write/manage/read_write) when it gave one; only fall back to
+        # keyword-guessing the edge's label text when it didn't.
+        if operation_hint in ("read", "write", "manage", "read_write"):
+            operation = operation_hint
+        else:
+            operation = self.operation_inferencer.infer_operation(edge_label)
 
         # Step 3: Get required actions based on operation
         actions = self._get_actions_for_operation(target_service, operation)

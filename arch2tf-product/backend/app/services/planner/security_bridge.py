@@ -162,6 +162,12 @@ def _build_resource_graph(parsed: "ParsedDiagram") -> dict:
             "to": c.target_id,
             "label": c.attribute_map.get("_label", ""),
             "type": "connection",
+            # Vision-LLM's own semantic read of this connection (see
+            # arch2terraform_bridge.py's _to_parsed_connections) — empty
+            # string for classical-pipeline connections, in which case
+            # dynamic_iam_generator.py falls back to its existing
+            # label-keyword inference exactly as before.
+            "operation_hint": c.attribute_map.get("_operation_hint", ""),
         }
         for c in parsed.connections
         if c.connection_type != "containment"

@@ -54,6 +54,15 @@ class ResourceRelationship:
     target_node_id: str
     relationship_type: str    # e.g. "network_ingress", "containment", "iam_attachment", "routes_to"
     label: str = ""
+    # Added 2026-07-31: the Vision-LLM's own semantic read of what this
+    # connection MEANS ("read"/"write"/"manage"/"read_write"/"network"),
+    # using the whole diagram's context — not just this edge's label text in
+    # isolation. Empty when the classical (non-Vision-LLM) pipeline produced
+    # this edge, or when the model wasn't confident enough to commit to one;
+    # arch2tf-product's dynamic_iam_generator.py prefers this over its own
+    # keyword-substring inference from the edge label when set. See
+    # vision_llm_detector.py's module docstring.
+    operation_hint: str = ""
 
 
 @dataclass

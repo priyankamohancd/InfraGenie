@@ -29,15 +29,30 @@ Integration contract
 `detect_via_vision_llm()` returns a full `ParsedDiagram` with `DiagramNode`s
 for every container and icon (containment expressed via `parent_id`, exactly
 like every other adapter). `image_ref` is set to the LLM's best-guess AWS
-service/resource name (e.g. "Amazon EC2", "VPC", "Public Subnet") rather than
-a terraform_type directly — this is deliberate: it lets the existing,
-audited `classifier.py` (icon_key/label_keyword matching against the
-catalog) do the actual AWS-resource-type resolution unchanged, so none of
-that already-tested logic needs to be duplicated or trusted to the LLM.
-Edge/arrow detection is NOT covered here (kept on the classical
-`edge_detector.py`, called separately by `image_adapter.py`) — arrows were
-never implicated in any of the detection-quality issues this module targets,
-so keeping that scope out reduces the size and risk of this change.
+service/resource name (e.g. "Amazon EC2", "VPC", "Public Subnet") for
+backward-compat display purposes, but each node's `extra["terraform_type_hint"]`
+also carries the model's own best-guess REAL catalog resource type (see
+`_terraform_type_catalog_text()` below) — `classifier.py`'s `_classify_node()`
+prefers this hint (when it names a real catalog type) over its own
+icon/label keyword matching, since the model has full-diagram context a
+per-node substring match structurally can't (e.g. telling an EKS cluster
+apart from its own worker nodes by reading "EKS Node 1" in context, not just
+matching "eks" as a substring of both).
+
+Edge/connection semantics (added 2026-07-31, same request that motivated
+the terraform_type_hint above): this module also asks the model what each
+connection between two elements actually MEANS — an AWS-API call vs. plain
+network traffic, and if it's an API call, a read vs. a write vs. a
+management operation — using the same
+full-diagram understanding, rather than leaving that judgment to
+`edge_detector.py`'s purely geometric arrow-tracing plus a keyword-substring
+guess at the label text afterward (see arch2tf-product's
+dynamic_iam_generator.EdgeOperationInferencer, which now prefers this hint
+when present). Arrow/line GEOMETRY (still needed when this module ISN'T
+enabled, i.e. the classical pipeline) stays on `edge_detector.py` — this
+module only adds semantic understanding on top of connections it can itself
+identify from the image; `image_adapter.py` falls back to classical
+geometric edge detection whenever this module reports zero connections.
 
 Failure handling
 -----------------
@@ -140,6 +155,15 @@ Return ONLY a single JSON object (no markdown fences, no prose before or after) 
       "parent_id": "<id of the immediately enclosing container/group element, or null if top-level>",
       "confidence": <float 0.0-1.0, your own confidence in this identification>
     }}
+  ],
+  "connections": [
+    {{
+      "from": "<id of the element this connection originates FROM>",
+      "to": "<id of the element this connection points TO>",
+      "label": "<any visible text label/caption on or near the arrow/line, verbatim, empty string if none>",
+      "operation": "read" | "write" | "manage" | "read_write" | "network" | null,
+      "confidence": <float 0.0-1.0, your own confidence in this identification>
+    }}
   ]
 }}
 
@@ -169,6 +193,30 @@ inside anything.
 color — do not skip anything just because it doesn't match a typical AWS icon color palette.
 - If a container/group box has no visible label, still include it with an empty "label" — do not \
 omit it.
+- Also identify EVERY arrow/line/connector between two elements and list it under "connections", \
+using the two elements' real "id" values from your own "elements" list above for "from"/"to" (the \
+direction the arrow points, not just which one is drawn first or on the left).
+- "operation" on a connection is YOUR OWN semantic judgment of what that connection actually means \
+for the infrastructure — not just a copy of the label text. Use the full diagram (both endpoints' \
+types, the label if any, and typical AWS architecture patterns you know) to decide:
+  - "network": plain network/HTTP(S) traffic between two infrastructure resources (e.g. ALB -> EC2, \
+EC2 -> RDS, Internet -> ALB, a user/client -> a public endpoint). This is the right answer for MOST \
+connections between compute/networking resources — do not force a read/write/manage answer onto a \
+connection that's really just "these two things talk over the network."
+  - "read": the source resource is reading/fetching/querying data FROM the target (e.g. "Read/Edit" \
+Lambda -> S3 for reading, "GetItem" App -> DynamoDB, "Query" App -> RDS for a read-only path).
+  - "write": the source resource is writing/publishing/sending data TO the target (e.g. "Publish" \
+App -> SNS, "PutObject" App -> S3, "SendMessage" App -> SQS).
+  - "manage": the source resource is administratively managing the target (create/delete/modify its \
+configuration), not just reading or writing its data.
+  - "read_write": the connection genuinely does both (e.g. an unlabeled or ambiguous "Read/Write" \
+caption), or you can't tell which of read/write it is but you're confident it's an AWS-API-level \
+data access rather than plain network traffic.
+  - null: you can't confidently classify this connection at all — better to leave it unset than guess.
+- Getting "network" vs. a data-access operation (read/write/manage/read_write) right matters more \
+than getting read vs. write exactly right within the data-access case: "network" connections are \
+secured with security groups, data-access connections need IAM policies — conflating the two \
+produces meaningfully wrong infrastructure.
 - Respond with ONLY the JSON object described above."""
 
 
@@ -245,11 +293,32 @@ def _extract_json(raw_text: str) -> dict:
     return json.loads(text)
 
 
-def _parse_response(data: dict) -> tuple[list[DiagramNode], list[str]]:
+def _build_id_map(elements: list) -> dict[str, str]:
+    """Mints a real UUID for every element with a local id, so both node
+    parent_id references AND connection from/to references (see
+    _parse_connections) can resolve regardless of list order — shared
+    between the two so a connection's "from"/"to" points at the SAME real
+    node id its DiagramNode got, not an independently-minted duplicate."""
+    id_map: dict[str, str] = {}
+    for el in elements:
+        local_id = el.get("id") if isinstance(el, dict) else None
+        if local_id:
+            id_map[str(local_id)] = str(uuid.uuid4())
+    return id_map
+
+
+def _parse_response(
+    data: dict, id_map: dict[str, str] | None = None
+) -> tuple[list[DiagramNode], list[str]]:
     """
     Converts the LLM's JSON element list into DiagramNodes. Pure function,
     no I/O — this is what unit tests exercise directly against canned JSON,
     without needing a real API call.
+
+    `id_map` is optional (built internally when omitted, e.g. every existing
+    caller/test that only cares about nodes) — `detect_via_vision_llm`
+    passes one in explicitly so it's shared with `_parse_connections`, see
+    `_build_id_map`'s docstring for why that sharing matters.
     """
     warnings: list[str] = []
     elements = data.get("elements")
@@ -258,13 +327,8 @@ def _parse_response(data: dict) -> tuple[list[DiagramNode], list[str]]:
             f"Vision LLM response missing a valid 'elements' list (got {type(elements).__name__})"
         )
 
-    # First pass: mint a real UUID for every element with a local id, so
-    # parent_id references can be resolved regardless of list order.
-    id_map: dict[str, str] = {}
-    for el in elements:
-        local_id = el.get("id") if isinstance(el, dict) else None
-        if local_id:
-            id_map[str(local_id)] = str(uuid.uuid4())
+    if id_map is None:
+        id_map = _build_id_map(elements)
 
     nodes: list[DiagramNode] = []
     for el in elements:
@@ -362,6 +426,92 @@ def _parse_response(data: dict) -> tuple[list[DiagramNode], list[str]]:
     return nodes, warnings
 
 
+# Mirrors dynamic_iam_generator.EdgeOperationInferencer's own operation
+# vocabulary in arch2tf-product (read/write/manage/read_write), plus
+# "network" — a value that vocabulary has no equivalent for today (it
+# infers an operation from every edge's label text regardless of whether
+# the edge is actually an AWS-API call at all, relying instead on a
+# separate hardcoded NON_IAM_TARGET_TYPES resource-type list to skip plain
+# network edges). Giving the model a way to say "this is just network
+# traffic" directly, using real diagram context, is a strictly better
+# signal than a static type list — see dynamic_iam_generator.py for how
+# "network" short-circuits policy generation the same way NON_IAM_TARGET_TYPES
+# does today.
+_VALID_OPERATIONS = {"read", "write", "manage", "read_write", "network"}
+
+
+def _parse_connections(data: dict, id_map: dict[str, str]) -> tuple[list[DiagramEdge], list[str]]:
+    """
+    Converts the LLM's JSON "connections" list into DiagramEdges, carrying
+    the model's own semantic operation_hint through extra[]. Pure function,
+    no I/O — same shape/testability as _parse_response.
+
+    Missing "connections" key is NOT an error (unlike a missing "elements"
+    list) — older canned test fixtures and any model response that simply
+    didn't include the key still produce a valid, edge-less result;
+    image_adapter.py's classical detect_edges() fallback covers that case.
+    """
+    warnings: list[str] = []
+    connections = data.get("connections")
+    if connections is None:
+        return [], warnings
+    if not isinstance(connections, list):
+        warnings.append(
+            f"Ignoring 'connections' — expected a list, got {type(connections).__name__}"
+        )
+        return [], warnings
+
+    edges: list[DiagramEdge] = []
+    for conn in connections:
+        if not isinstance(conn, dict):
+            warnings.append(f"Skipped malformed connection (not an object): {conn!r}")
+            continue
+
+        from_local, to_local = conn.get("from"), conn.get("to")
+        source_id = id_map.get(str(from_local)) if from_local else None
+        target_id = id_map.get(str(to_local)) if to_local else None
+        if not source_id or not target_id:
+            warnings.append(
+                f"Skipped connection {from_local!r}->{to_local!r} — 'from'/'to' doesn't "
+                "reference a known element id"
+            )
+            continue
+
+        label = str(conn.get("label") or "").strip()
+
+        operation_raw = conn.get("operation")
+        operation = str(operation_raw).strip().lower() if operation_raw else ""
+        if operation and operation not in _VALID_OPERATIONS:
+            warnings.append(
+                f"Connection {from_local!r}->{to_local!r} — ignoring invalid operation "
+                f"{operation!r} (not one of {sorted(_VALID_OPERATIONS)}); falling back to "
+                "label-keyword inference for it"
+            )
+            operation = ""
+
+        confidence = conn.get("confidence")
+        try:
+            confidence = float(confidence) if confidence is not None else None
+        except (TypeError, ValueError):
+            confidence = None
+
+        edges.append(
+            DiagramEdge(
+                id=str(uuid.uuid4()),
+                source_id=source_id,
+                target_id=target_id,
+                label=label,
+                extra={
+                    "stage": "vision_llm",
+                    "operation_hint": operation,
+                    "vision_confidence": confidence,
+                },
+            )
+        )
+
+    return edges, warnings
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -375,9 +525,12 @@ def detect_via_vision_llm(
     call_api: Callable[[str, str, str, str, str | None, int], str] | None = None,
 ) -> ParsedDiagram:
     """
-    Detect every container/icon on `image_path` via a vision-capable LLM
-    call and return a full ParsedDiagram (nodes only — edges remain the
-    classical `edge_detector.py`'s responsibility, see module docstring).
+    Detect every container/icon AND connection on `image_path` via a single
+    vision-capable LLM call and return a full ParsedDiagram. Edges here
+    carry the model's own semantic operation_hint (see module docstring);
+    `image_adapter.py` falls back to classical `edge_detector.py` when this
+    returns zero connections (e.g. a diagram with genuinely no drawn
+    arrows, or a model response that omitted the "connections" key).
 
     Parameters
     ----------
@@ -424,21 +577,30 @@ def detect_via_vision_llm(
             f"Vision LLM did not return valid JSON: {exc}. Raw response (truncated): {raw_text[:500]!r}"
         ) from exc
 
-    nodes, warnings = _parse_response(data)
+    # Built once, shared between node and connection parsing — see
+    # _build_id_map's docstring for why a connection's from/to must resolve
+    # to the SAME real node id its DiagramNode got, not an independent one.
+    elements_raw = data.get("elements")
+    id_map = _build_id_map(elements_raw) if isinstance(elements_raw, list) else {}
+
+    nodes, node_warnings = _parse_response(data, id_map)
+    edges, edge_warnings = _parse_connections(data, id_map)
+    warnings = node_warnings + edge_warnings
     if not nodes:
         warnings.append("Vision LLM returned zero usable elements for this diagram.")
 
     logger.info(
-        "[Vision LLM] Detected %d elements (%d containers, %d icons) in '%s'",
+        "[Vision LLM] Detected %d elements (%d containers, %d icons) and %d connections in '%s'",
         len(nodes),
         sum(1 for n in nodes if n.shape == NodeShape.CONTAINER),
         sum(1 for n in nodes if n.shape == NodeShape.ICON),
+        len(edges),
         path.name,
     )
 
     return ParsedDiagram(
         nodes=nodes,
-        edges=[],
+        edges=edges,
         source_format="image",
         source_file=str(path),
         warnings=warnings,

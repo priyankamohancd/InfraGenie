@@ -167,6 +167,14 @@ def _to_parsed_connections(graph: A2TFResourceGraph) -> list[ParsedConnection]:
         # Level-1 inference (label -> protocol/port), which silently never
         # fired before this since attribute_map was always empty.
         attribute_map = {"_label": rel.label} if rel.label else {}
+        # Added 2026-07-31: the Vision-LLM path's own semantic read of what
+        # this connection means (read/write/manage/read_write/network,
+        # using full-diagram context) — see ResourceRelationship.operation_hint
+        # and vision_llm_detector.py's module docstring. Same "_"-prefixed
+        # metadata convention as "_label" just above. Empty for every
+        # connection from the classical (non-Vision-LLM) pipeline.
+        if rel.operation_hint:
+            attribute_map["_operation_hint"] = rel.operation_hint
         connections.append(ParsedConnection(
             source_id=rel.source_node_id,
             target_id=rel.target_node_id,

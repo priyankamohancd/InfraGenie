@@ -416,9 +416,15 @@ class ImageAdapter(BaseAdapter):
     def _parse_via_vision_llm(self, path: Path, bgr: np.ndarray) -> ParsedDiagram:
         """
         Vision-LLM path (see vision_llm_detector.py's module docstring).
-        Replaces Stages 1-4 entirely; Stage 5 (edge/arrow detection) still
-        runs classically since it was never implicated in the
-        detection-quality problems this path exists to fix.
+        Replaces Stages 1-4 entirely. Edge/connection detection is now ALSO
+        handled by the same vision-LLM call (added 2026-07-31, per explicit
+        follow-up request for the model to actually understand what a
+        connection between two resources means, not just that a line exists
+        between them) — classical `detect_edges()` runs only as a fallback
+        when the model reported zero connections (e.g. a diagram with
+        genuinely no drawn arrows, or a response that omitted the
+        "connections" key), so a diagram never silently ends up with no
+        edges at all just because the model didn't return any.
 
         Any VisionLLMError is deliberately allowed to propagate (not
         swallowed into a stub/empty result) — same reasoning as
@@ -432,9 +438,13 @@ class ImageAdapter(BaseAdapter):
             api_key=self._vision_llm_api_key,
         )
 
-        logger.info("[Stage 5] Detecting edges")
-        edges = detect_edges(bgr, parsed.nodes)
-        logger.info("[Stage 5] Found %d edges", len(edges))
+        if parsed.edges:
+            logger.info("[Vision LLM] Using %d model-detected connections", len(parsed.edges))
+            edges = parsed.edges
+        else:
+            logger.info("[Stage 5] Vision LLM reported no connections — falling back to classical edge detection")
+            edges = detect_edges(bgr, parsed.nodes)
+            logger.info("[Stage 5] Found %d edges", len(edges))
 
         return ParsedDiagram(
             nodes=parsed.nodes,

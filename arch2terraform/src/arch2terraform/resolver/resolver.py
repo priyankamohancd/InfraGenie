@@ -10,9 +10,15 @@ Two sources of relationships:
      or whose bbox sits inside a container's bbox, becomes a "containment"
      relationship (e.g. EC2 instance inside a VPC/subnet box).
 
-This is deliberately rule-based rather than ML-based: relationships in
-architecture diagrams are conventionally drawn, and the diagram is the
-source of truth, so we trust its explicit structure over inference.
+Relationship TYPE (network_ingress / routes_to / iam_attachment /
+containment) is deliberately rule-based rather than ML-based: which
+category a connection falls into is fully determined by its two endpoint
+resource TYPES, which are already known and trustworthy by this point — no
+judgment call needed. What a relationship semantically MEANS beyond its
+type (e.g. "this app -> S3 edge is a write, not just a generic routes_to")
+is a genuinely different, harder question that DOES benefit from a model
+with real diagram context — see ResourceRelationship.operation_hint,
+populated when the Vision-LLM path produced the underlying edge.
 """
 
 from __future__ import annotations
@@ -63,6 +69,11 @@ def _resolve_explicit_edges(
                 target_node_id=edge.target_id,
                 relationship_type=rel_type,
                 label=edge.label,
+                # Passed through from vision_llm_detector.py when that path
+                # produced this edge — see ResourceRelationship's own
+                # docstring for why this is trusted downstream over
+                # label-keyword inference.
+                operation_hint=str(edge.extra.get("operation_hint") or ""),
             )
         )
 
