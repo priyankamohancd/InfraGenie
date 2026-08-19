@@ -329,7 +329,11 @@ def _detect_edge_lines(
     raw_v: list[tuple[float, float, float]] = []
     if lines is not None:
         for line in lines:
-            x1, y1, x2, y2 = line[0]
+            # cv2.HoughLinesP's return shape changed between OpenCV versions
+            # (N,1,4) pre-5.0 vs (N,4) from 5.0 onward -- reshape(-1) flattens
+            # either shape to a plain length-4 array so unpacking is safe
+            # regardless of which OpenCV is installed.
+            x1, y1, x2, y2 = line.reshape(-1)[:4]
             if abs(y2 - y1) <= cfg.edge_line_axis_tol and abs(x2 - x1) >= cfg.edge_hough_min_len:
                 raw_h.append((float(min(x1, x2)), float(max(x1, x2)), float((y1 + y2) / 2)))
             elif abs(x2 - x1) <= cfg.edge_line_axis_tol and abs(y2 - y1) >= cfg.edge_hough_min_len:
@@ -953,41 +957,128 @@ def _collapse_wall_reuse_chains(
     See call-site comment. Groups regions that share the same LEFT+RIGHT
     walls (within ``tol`` px) but differ in vertical extent, and separately
     groups regions sharing the same TOP+BOTTOM walls but differing in
-    horizontal extent. Within each such group, keeps only the LARGEST
-    member (assumed to be the real, complete boundary — Hough line
-    assembly tends to surface the true far wall as one of the candidates,
-    typically the outermost) and drops the smaller ones IF AND ONLY IF the
-    smaller one's bbox is (near-)fully contained within the larger one's —
-    real side-by-side siblings sharing a wall never satisfy this, since
-    their other two edges don't overlap each other.
+    horizontal extent. Within each such group, the ORIGINAL rule kept only
+    the LARGEST member (assumed to be the real, complete boundary — Hough
+    line assembly tends to surface the true far wall as one of the
+    candidates, typically the outermost) and dropped the smaller ones IF
+    AND ONLY IF the smaller one's bbox is (near-)fully contained within
+    the larger one's, on the theory that "real side-by-side siblings
+    sharing a wall never satisfy this, since their other two edges don't
+    overlap each other."
+
+    That theory holds for pairs of siblings, but breaks for the UNION of
+    several siblings: N real, non-overlapping containers stacked along the
+    varying axis (e.g. 3 real subnet bands stacked inside one VPC) all
+    share the VPC's left/right walls with each other AND, critically, with
+    a spurious "top-of-band-1-to-bottom-of-band-N" composite that the same
+    Hough line assembly also produces (by pairing band 1's top wall with
+    band N's bottom wall and skipping the real dividers in between). That
+    composite trivially satisfies "largest, and every real sibling is
+    fully contained within it" — so the original rule silently collapsed
+    all 3 real subnets into that one spurious union. Confirmed via a
+    direct repro against tests/fixtures/images/aws_icon_diagram.png
+    (2026-08-19): before this fix, all 3 orange_subnet bands collapsed
+    into a single region spanning the full stack.
+
+    Fix: before dropping everything nested inside the group's largest
+    member, check whether those nested candidates themselves tile — i.e.
+    form a set of MUTUALLY NON-OVERLAPPING regions that together cover
+    most of the largest member's extent. Real, distinct siblings tile this
+    way almost perfectly (each occupies its own slice with only small gaps
+    between them). Genuine wall-reuse duplicates of a single container do
+    the opposite: they're all near-restatements of the same box with only
+    the ambiguous 4th wall's position varying, so they overlap each other
+    heavily and no non-trivial tiling exists among them. When a real
+    tiling is found, the "largest" is the spurious one — drop it (and any
+    other nested candidate not part of the tiling) and keep the tiling
+    siblings instead. Otherwise, fall back to the original behaviour.
     """
     def _bucket(v: float) -> int:
         return round(v / max(tol, 1))
 
-    # x-span groups: same left AND right x → compare vertical extent.
-    x_groups: dict[tuple[int, int], list[ContainerRegion]] = {}
-    for r in regions:
-        key = (_bucket(r.bbox.x), _bucket(r.bbox.x + r.bbox.width))
-        x_groups.setdefault(key, []).append(r)
+    def _axis_span(r: ContainerRegion, axis: str) -> tuple[float, float]:
+        if axis == "y":
+            return r.bbox.y, r.bbox.y + r.bbox.height
+        return r.bbox.x, r.bbox.x + r.bbox.width
 
-    # y-span groups: same top AND bottom y → compare horizontal extent.
-    y_groups: dict[tuple[int, int], list[ContainerRegion]] = {}
-    for r in regions:
-        key = (_bucket(r.bbox.y), _bucket(r.bbox.y + r.bbox.height))
-        y_groups.setdefault(key, []).append(r)
+    def _tiling_subset(nested: list[ContainerRegion]) -> list[ContainerRegion]:
+        """Greedily builds the finest-grained set of mutually
+        non-overlapping candidates from `nested`, smallest-area first, so
+        real distinct siblings (small, disjoint) are preferred over
+        coarser partial composites that happen to also fit the group."""
+        chosen: list[ContainerRegion] = []
+        for r in sorted(nested, key=lambda r: r.area):
+            if all(_bbox_overlap_fraction(r.bbox, p.bbox) <= 0.15 for p in chosen):
+                chosen.append(r)
+        return chosen
 
-    to_drop: set[str] = set()
-    for group in list(x_groups.values()) + list(y_groups.values()):
-        if len(group) < 2:
-            continue
-        largest = max(group, key=lambda r: r.area)
-        for r in group:
-            if r.node_id == largest.node_id:
+    def _tiling_coverage(chosen: list[ContainerRegion], largest: ContainerRegion, axis: str) -> float:
+        largest_start, largest_end = _axis_span(largest, axis)
+        largest_len = max(largest_end - largest_start, 1.0)
+        covered = sum(
+            max(min(e, largest_end) - max(s, largest_start), 0.0)
+            for s, e in (_axis_span(r, axis) for r in chosen)
+        )
+        return covered / largest_len
+
+    def _collapse_pass(current: list[ContainerRegion], axis: str) -> list[ContainerRegion]:
+        groups: dict[tuple[int, int], list[ContainerRegion]] = {}
+        for r in current:
+            if axis == "y":
+                # same left AND right x -> compare vertical extent.
+                key = (_bucket(r.bbox.x), _bucket(r.bbox.x + r.bbox.width))
+            else:
+                # same top AND bottom y -> compare horizontal extent.
+                key = (_bucket(r.bbox.y), _bucket(r.bbox.y + r.bbox.height))
+            groups.setdefault(key, []).append(r)
+
+        to_drop: set[str] = set()
+        for group in groups.values():
+            if len(group) < 2:
                 continue
-            if _bbox_overlap_fraction(r.bbox, largest.bbox) >= 0.95:
-                to_drop.add(r.node_id)
+            largest = max(group, key=lambda r: r.area)
+            nested = [
+                r for r in group
+                if r.node_id != largest.node_id
+                and _bbox_overlap_fraction(r.bbox, largest.bbox) >= 0.95
+            ]
+            if not nested:
+                continue
 
-    return [r for r in regions if r.node_id not in to_drop]
+            tiling = _tiling_subset(nested)
+            if len(tiling) >= 2 and _tiling_coverage(tiling, largest, axis) >= 0.6:
+                # `largest` is a spurious union of real, distinct siblings
+                # that happen to share its walls -- drop the union and any
+                # other redundant nested candidate, keep the tiling.
+                to_drop.add(largest.node_id)
+                keep_ids = {r.node_id for r in tiling}
+                to_drop.update(r.node_id for r in nested if r.node_id not in keep_ids)
+            else:
+                # Genuine wall-reuse chain: one real container, several
+                # redundant near-duplicate candidates for its ambiguous
+                # 4th wall. Keep the largest, drop the rest (original
+                # behaviour).
+                to_drop.update(r.node_id for r in nested)
+
+        return [r for r in current if r.node_id not in to_drop]
+
+    # Run the vertical-extent pass (shared left/right walls) fully first,
+    # THEN run the horizontal-extent pass (shared top/bottom walls) over
+    # only what survived. Doing both passes against the same original,
+    # unfiltered region list (as a single earlier version of this function
+    # did) let a region the first pass had already identified as spurious
+    # still "win" a second-pass pairing against a region the first pass
+    # wanted to keep -- e.g. two near-identical (~1-2px apart) candidates
+    # for the real middle subnet band landing in the same top/bottom
+    # bucket, one of which the vertical pass had already dropped as a
+    # redundant duplicate; comparing it against the other in the
+    # horizontal pass caused BOTH to be dropped and the real band vanished
+    # entirely (confirmed via direct repro against aws_icon_diagram.png,
+    # 2026-08-19). Sequencing the passes so the second only ever compares
+    # among first-pass survivors removes that cross-pass contamination.
+    working = _collapse_pass(list(regions), "y")
+    working = _collapse_pass(working, "x")
+    return working
 
 
 def _suppress_near_duplicate_composites(

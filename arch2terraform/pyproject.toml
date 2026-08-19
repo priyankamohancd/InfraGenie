@@ -20,7 +20,12 @@ dev = [
 phase3 = [
     "Pillow>=10.0",
     "imagehash>=4.3",
-    "opencv-python-headless>=4.9",
+    # Pinned below 5.0: OpenCV 5.0 changed cv2.HoughLinesP's return shape
+    # from (N,1,4) to (N,4), which broke layout_detector.py/edge_detector.py
+    # (both now use a shape-agnostic reshape(-1)[:4] unpack, so this pin is
+    # a belt-and-suspenders safety net, not the only fix). Confirmed via a
+    # clean-venv repro on 2026-08-18 -- see the reproducibility notes.
+    "opencv-python-headless>=4.9,<5",
     "numpy>=1.26",
     "pytesseract>=0.3",
 ]

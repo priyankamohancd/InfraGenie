@@ -378,6 +378,26 @@ class CompleteSecurityOrchestrator:
             code += f'  }})\n'
             code += f'}}\n\n'
 
+            # EC2 cannot attach an IAM role directly — it needs an instance
+            # profile wrapping it. security_bridge.py's
+            # ATTACHMENT_ATTR_BY_RESOURCE_TYPE["aws_instance"] wires an
+            # EC2 instance's iam_instance_profile attribute onto
+            # aws_iam_instance_profile.{role_tf_id}_profile.name unconditionally
+            # for every EC2-attached role, so that resource must always be
+            # declared here or the reference dangles. Found 2026-08-18: this
+            # method is a separate, actually-wired reimplementation of the
+            # same responsibility as terraform_generator.py's
+            # generate_iam_hcl() (unused in this pipeline), which already had
+            # this instance-profile step — it was simply never carried over
+            # when this method was written, so every diagram generating an
+            # EC2 role failed real `terraform validate` with "Reference to
+            # undeclared resource" on modules/security/outputs.tf.
+            if "ec2" in role_data.get("service_principal", ""):
+                code += f'resource "aws_iam_instance_profile" "{role_tf_id}_profile" {{\n'
+                code += f'  name = "{role_name}-profile"\n'
+                code += f'  role = aws_iam_role.{role_tf_id}.name\n'
+                code += f'}}\n\n'
+
             # Mandatory AWS-managed policy attachments (e.g. EKS's required
             # AmazonEKSClusterPolicy) — separate from the edge-derived
             # inline policies below since these are fixed per-service

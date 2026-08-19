@@ -79,6 +79,16 @@ def _reset_job_store_state():
     job_store._LOCAL_STORE.update(original_store)
 
 
+# NOTE (2026-08-19): this file used to carry its own `_no_real_redis_connection`
+# monkeypatch fixture here. It's been superseded by a suite-wide equivalent
+# in tests/conftest.py, after the same real-Redis-reachability problem this
+# fixture guarded against turned out to also corrupt real job records via
+# test_apply_runner.py::test_reconcile_destroys_overdue_job_after_simulated_restart
+# (see that file and conftest.py's docstring for the full story). Keeping
+# the isolation centralized there so every test file gets it automatically
+# instead of each one needing to remember to add its own copy.
+
+
 @pytest.mark.anyio
 async def test_save_job_falls_back_when_redis_command_fails_after_successful_ping():
     job_store._redis = _FlakyRedis()

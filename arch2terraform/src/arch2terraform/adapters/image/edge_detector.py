@@ -231,7 +231,10 @@ def detect_edges(
     pair_directed: dict[tuple[str, str], bool] = {}
 
     for seg in raw_lines:
-        x1, y1, x2, y2 = seg[0]
+        # Same OpenCV-version shape difference as layout_detector.py's
+        # _detect_edge_lines -- reshape(-1) is safe under both the pre-5.0
+        # (N,1,4) and 5.0+ (N,4) HoughLinesP return shapes.
+        x1, y1, x2, y2 = seg.reshape(-1)[:4]
         ep_a = (float(x1), float(y1))
         ep_b = (float(x2), float(y2))
 
