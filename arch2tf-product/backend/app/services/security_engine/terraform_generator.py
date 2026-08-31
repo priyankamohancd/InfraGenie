@@ -2,8 +2,14 @@
 Generate Terraform HCL code from security configuration
 """
 import json
+import re
 from typing import Dict, List
 from models import SecurityConfiguration, SecurityGroup, SecurityGroupRule, RuleType
+
+# Any run of one-or-more characters that ISN'T a lowercase letter or digit
+# collapses to a single underscore — see _sanitize_id's docstring below for
+# why this replaced the old per-character .replace() chain.
+_NON_ALNUM_RUN_RE = re.compile(r"[^a-z0-9]+")
 
 
 class TerraformSecurityGenerator:
@@ -171,8 +177,41 @@ resource "aws_security_group" "{sg.resource_name}" {{
         return json.dumps(d, indent=2)
 
     def _sanitize_id(self, id_str: str) -> str:
-        """Sanitize string for use as Terraform resource identifier"""
-        return id_str.lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+        """
+        Sanitize an arbitrary string into a valid Terraform resource
+        identifier (letters, digits, underscores, hyphens only; must not
+        start with a digit).
+
+        Real bug, found 2026-08-20: the previous implementation only
+        replaced hyphens/spaces/periods, so ANY other punctuation in the
+        source string — parentheses, slashes, colons, commas, etc. —
+        passed straight through into the generated resource name.
+        `terraform init` rejects that outright with "Invalid resource
+        name". Root cause traced to a real generated file:
+        `rule.rule_id` here is frequently built from a diagram connection's
+        verbatim label (e.g. "EKS Node Group (2 worker nodes) to
+        ElastiCache Cluster" from the Vision-LLM path — see
+        vision_llm_detector.py's "label" field, copied through
+        unmodified), and the old .replace() chain let "(2" and "nodes)"
+        reach the resource name as literal, invalid characters. This
+        became far more likely to trigger once the Vision-LLM path was
+        enabled, since its labels are richer natural-language text than
+        the classical pipeline's typically-short OCR'd labels — but the
+        same bug could always have hit any sufficiently punctuated label,
+        classical or VLM.
+
+        Collapses every run of one-or-more non-alphanumeric characters to
+        a single underscore (not a per-character replacement, so
+        "(2 worker" becomes "_2_worker" rather than fragmenting into
+        multiple separate underscores per character), strips any
+        leading/trailing underscore left over, then guards against a
+        still-invalid leading digit (Terraform identifiers must not start
+        with one) by prefixing "r_".
+        """
+        slug = _NON_ALNUM_RUN_RE.sub("_", id_str.lower()).strip("_")
+        if slug and slug[0].isdigit():
+            slug = f"r_{slug}"
+        return slug or "unnamed"
 
     def generate_security_validation_script(self) -> str:
         """Generate bash script for security validation"""

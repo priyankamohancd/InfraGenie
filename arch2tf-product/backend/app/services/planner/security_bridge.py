@@ -33,12 +33,21 @@ for arch2terraform's src/.
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 log = logging.getLogger(__name__)
+
+# Same fix as security_group_generator.py's _get_sg_resource_name (found
+# 2026-08-20, then found AGAIN here 2026-08-24 in a real retest) —
+# _sg_terraform_name below deliberately duplicates that function's string
+# transform (see its own docstring) so it must be updated identically any
+# time that one changes, or this bridge will predict a stale/wrong SG name
+# and fail to find the real security group to wire onto a resource.
+_NON_ALNUM_RUN_RE = re.compile(r"[^a-z0-9]+")
 
 _SECURITY_ENGINE_SRC = Path(__file__).resolve().parents[1] / "security_engine"
 if str(_SECURITY_ENGINE_SRC) not in sys.path:
@@ -117,8 +126,16 @@ def _sg_terraform_name(namespace: str, resource_label: str) -> str:
     SecurityGroupGenerator, and this only needs the pure string transform to
     predict what name a given resource's SG WOULD have, so we can check
     whether the engine actually generated one for it and wire the real
-    resource address rather than guess-and-hope."""
-    return f"{namespace}_{resource_label.lower().replace(' ', '_').replace('-', '_')}_sg"
+    resource address rather than guess-and-hope.
+
+    Updated 2026-08-24 alongside _get_sg_resource_name's fix: collapse any
+    run of non-alphanumeric characters (not just spaces/hyphens) into a
+    single underscore, since a diagram label can contain arbitrary
+    punctuation (e.g. a Vision-LLM label like "EKS Node Group (2 worker
+    nodes)"). Must stay byte-for-byte in sync with that function.
+    """
+    clean_label = _NON_ALNUM_RUN_RE.sub("_", resource_label.lower()).strip("_")
+    return f"{namespace}_{clean_label}_sg"
 
 
 def _build_resource_graph(parsed: "ParsedDiagram") -> dict:
@@ -234,14 +251,18 @@ def run_security_engine(
 
     # Cosmetic identifier-hygiene fix, 2026-07-24: this used to hyphen-join
     # ("demo-dev"), which then got spliced raw into every generated SG/IAM
-    # Terraform identifier (_sg_terraform_name only strips hyphens from
-    # resource_label, not namespace) — e.g. `aws_security_group.demo-dev_
-    # public_alb_sg`. Hyphenated HCL identifiers are legal Terraform (this
-    # was never a `terraform validate` bug), but underscore-only keeps
-    # every generated identifier consistent with resource_label's own
-    # underscore convention. NOTE: this does NOT fix Checkov's CKV2_AWS_5
-    # false positive below — that's a separate, confirmed graph-resolution
-    # limitation (see the checkov:skip annotation in terraform_generator.py).
+    # Terraform identifier — e.g. `aws_security_group.demo-dev_public_alb_sg`.
+    # Hyphenated HCL identifiers are legal Terraform (this was never a
+    # `terraform validate` bug), but underscore-only keeps every generated
+    # identifier consistent with resource_label's own underscore convention.
+    # (Note, updated 2026-08-24: _sg_terraform_name/_get_sg_resource_name now
+    # collapse ANY non-alphanumeric run in resource_label into an underscore,
+    # not just hyphens — see their own docstrings — so this namespace join is
+    # the only remaining place a raw hyphen can still reach a generated
+    # identifier, which is fine since hyphens are valid HCL.) NOTE: this does
+    # NOT fix Checkov's CKV2_AWS_5 false positive below — that's a separate,
+    # confirmed graph-resolution limitation (see the checkov:skip annotation
+    # in terraform_generator.py).
     namespace = f"{project_name}_{environment}"
     orchestrator = CompleteSecurityOrchestrator(namespace=namespace, vpc_id=vpc_id_ref)
 

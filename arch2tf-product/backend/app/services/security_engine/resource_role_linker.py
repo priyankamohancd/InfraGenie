@@ -2,8 +2,15 @@
 Resource-Role Linker
 Maps resources to roles and generates attachment code
 """
+import re
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
+
+# Same fix as terraform_generator.py's _NON_ALNUM_RUN_RE (found 2026-08-20,
+# see _sanitize_tf_id's docstring below) — collapses any run of
+# non-alphanumeric characters into a single underscore, instead of only
+# handling spaces/hyphens/periods.
+_NON_ALNUM_RUN_RE = re.compile(r"[^a-z0-9]+")
 
 
 @dataclass
@@ -119,9 +126,22 @@ class ResourceRoleLinker:
         `role_tf_id` exactly, so attachment code's `aws_iam_role.<id>`
         references actually match the resource address iam_roles.tf
         declares the role under.
+
+        Updated 2026-08-24 alongside complete_security_orchestrator.py's
+        `_tf_id` fix: that file switched its role_tf_id derivation from a
+        naive `.replace('-', '_')` to a regex collapse of ANY
+        non-alphanumeric run (found via a real retest — a Vision-LLM label
+        with parentheses broke `terraform init` on modules/security). Both
+        still build `role_name` from `resource_label`/`compute_label` via
+        the identical `f"role-{label.lower().replace(' ', '-')}"` step
+        first, so as long as the FINAL collapse step here matches that
+        file's `_tf_id` exactly, the two independently-computed ids stay
+        identical for the same input label. If that file's collapsing
+        logic changes again, this must change identically or attachment
+        code will reference a role address that's never declared.
         """
         role_name = f"role-{resource_label.lower().replace(' ', '-')}"
-        return role_name.replace('-', '_')
+        return _NON_ALNUM_RUN_RE.sub("_", role_name).strip("_")
 
     def _generate_role_arn(self, role_name: str) -> str:
         """Generate ARN for role"""
@@ -248,8 +268,26 @@ resource "aws_sfn_state_machine" "{resource_id}" {{
 """
 
     def _sanitize_tf_id(self, text: str) -> str:
-        """Sanitize text for Terraform resource identifier"""
-        return text.lower().replace(' ', '_').replace('-', '_').replace('.', '_')
+        """
+        Sanitize an arbitrary string into a valid Terraform resource
+        identifier (letters, digits, underscores, hyphens only; must not
+        start with a digit).
+
+        Same bug as terraform_generator.py's _sanitize_id, found 2026-08-20
+        via the same "Invalid resource name" terraform init failure: the old
+        .replace() chain here only handled spaces/hyphens/periods, so any
+        other punctuation carried through a diagram label (e.g. Vision-LLM
+        edge labels like "EKS Node Group (2 worker nodes) to ElastiCache
+        Cluster" — see vision_llm_detector.py) reached generated resource
+        names as literal invalid characters. Fixed identically: collapse
+        every run of non-alphanumeric characters to a single underscore,
+        strip stray leading/trailing underscores, and guard against a
+        leading digit.
+        """
+        slug = _NON_ALNUM_RUN_RE.sub("_", text.lower()).strip("_")
+        if slug and slug[0].isdigit():
+            slug = f"r_{slug}"
+        return slug or "unnamed"
 
     def generate_linking_report(self) -> str:
         """Generate a report showing resource-role mappings"""

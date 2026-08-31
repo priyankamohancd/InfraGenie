@@ -9,11 +9,37 @@ Integrates all components:
 """
 from typing import Dict, List, Tuple, Optional
 import json
+import re
 from dataclasses import dataclass, asdict
 from traffic_flow_analyzer import TrafficFlowAnalyzer, TrafficFlowVisualizer
 from security_group_generator import SecurityGroupGenerator
 from dynamic_iam_generator import UniversalPolicyBuilder, DynamicActionRegistry
 from resource_role_linker import ResourceRoleLinker
+
+# Same fix as terraform_generator.py's _NON_ALNUM_RUN_RE and
+# resource_role_linker.py's _sanitize_tf_id (found 2026-08-20, then found
+# AGAIN here 2026-08-24 in a real retest — this file's role/policy/SG
+# terraform-id derivation is a third, independent naive `.replace('-', '_')`
+# chain that never got the same fix). Collapses any run of non-alphanumeric
+# characters into a single underscore.
+#
+# IMPORTANT: resource_role_linker.py's `_role_tf_id` static method
+# deliberately reproduces this file's role_tf_id scheme so that
+# ResourceRoleLinker's attachment code (`aws_iam_role.<id>.arn`, etc.)
+# references the exact resource address this file declares the role under.
+# If this helper's collapsing logic ever changes, `_role_tf_id` in
+# resource_role_linker.py MUST change identically, or attachment code will
+# reference a role address that was never declared ("Reference to
+# undeclared resource").
+_NON_ALNUM_RUN_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _tf_id(text: str) -> str:
+    """Sanitize an arbitrary string into a valid Terraform resource identifier."""
+    slug = _NON_ALNUM_RUN_RE.sub("_", text.lower()).strip("_")
+    if slug and slug[0].isdigit():
+        slug = f"r_{slug}"
+    return slug or "unnamed"
 
 
 @dataclass
@@ -363,7 +389,7 @@ class CompleteSecurityOrchestrator:
         code = "# Auto-generated IAM Roles and Policies\n\n"
 
         for role_name, role_data in iam_roles.items():
-            role_tf_id = role_name.replace('-', '_')
+            role_tf_id = _tf_id(role_name)
 
             # Role
             code += f'resource "aws_iam_role" "{role_tf_id}" {{\n'
@@ -415,7 +441,7 @@ class CompleteSecurityOrchestrator:
             # would collide when a role has more than one policy, which
             # Terraform rejects as a duplicate resource definition)
             for policy in role_data.get('policies', []):
-                policy_tf_id = policy['name'].replace('-', '_').replace(' ', '_')
+                policy_tf_id = _tf_id(policy['name'])
                 code += f'resource "aws_iam_role_policy" "{role_tf_id}_{policy_tf_id}" {{\n'
                 code += f'  name = "{policy["name"]}"\n'
                 code += f'  role = aws_iam_role.{role_tf_id}.id\n'
@@ -475,7 +501,7 @@ data "aws_region" "current" {
         if security_config:
             code += "# Security Group Outputs\n"
             for sg_name, sg in security_config.security_groups.items():
-                sg_tf_id = sg_name.replace('-', '_')
+                sg_tf_id = _tf_id(sg_name)
                 code += f'output "{sg_tf_id}_id" {{\n'
                 code += f'  description = "Security Group ID for {sg.name}"\n'
                 code += f'  value       = aws_security_group.{sg_tf_id}.id\n'
@@ -484,7 +510,7 @@ data "aws_region" "current" {
         # IAM Role outputs
         code += "# IAM Role Outputs\n"
         for role_name, role_data in iam_roles.items():
-            role_tf_id = role_name.replace('-', '_')
+            role_tf_id = _tf_id(role_name)
             code += f'output "{role_tf_id}_arn" {{\n'
             code += f'  description = "ARN of IAM role {role_name}"\n'
             code += f'  value       = aws_iam_role.{role_tf_id}.arn\n'

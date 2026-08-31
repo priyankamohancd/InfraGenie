@@ -1,11 +1,28 @@
 """
 Security group generation from architecture diagrams
 """
+import re
 from typing import Dict, List, Set, Tuple, Optional
 from models import (
     SecurityGroup, SecurityGroupRule, SecurityConfiguration,
     RuleType, ResourceType, SERVICE_PORTS
 )
+
+# Same fix as terraform_generator.py's _NON_ALNUM_RUN_RE (found 2026-08-20,
+# then found AGAIN here 2026-08-24 in a real retest). _get_sg_resource_name
+# below is the actual SOURCE of SecurityGroup.resource_name — the string
+# every downstream consumer (SecurityConfiguration.add_security_group's
+# dict key, terraform_generator.py's `resource "aws_security_group" "..."`
+# declaration, complete_security_orchestrator.py's outputs.tf reference)
+# treats as an already-valid Terraform identifier and reuses verbatim. Its
+# old .replace(' ','_').replace('-','_') chain left any other punctuation
+# in the diagram label (e.g. "EKS Node Group (2 worker nodes)") in place,
+# so the SG resource itself could be declared under an invalid identifier
+# at the source — fixing it here means every downstream consumer inherits
+# a clean value instead of each needing its own separate re-sanitization
+# (and risking diverging from one another, which would trade this bug for
+# a "Reference to undeclared resource" one).
+_NON_ALNUM_RUN_RE = re.compile(r"[^a-z0-9]+")
 
 
 class SecurityGroupGenerator:
@@ -343,5 +360,18 @@ class SecurityGroupGenerator:
         )
 
     def _get_sg_resource_name(self, resource_label: str) -> str:
-        """Convert resource label to security group resource name"""
-        return f"{self.namespace}_{resource_label.lower().replace(' ', '_').replace('-', '_')}_sg"
+        """
+        Convert resource label to security group resource name.
+
+        `resource_label` comes straight from the diagram (e.g. a Vision-LLM
+        node label like "EKS Node Group (2 worker nodes)") and may contain
+        arbitrary punctuation. Collapse any run of non-alphanumeric
+        characters to a single underscore instead of only handling spaces
+        and hyphens — see the module-level comment on _NON_ALNUM_RUN_RE for
+        why this must stay the single source of truth other files rely on.
+        `self.namespace` is deliberately left unsanitized here: Terraform
+        resource identifiers permit hyphens, so a namespace like
+        "my-project" is already valid as-is.
+        """
+        clean_label = _NON_ALNUM_RUN_RE.sub("_", resource_label.lower()).strip("_")
+        return f"{self.namespace}_{clean_label}_sg"

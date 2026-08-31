@@ -39,6 +39,20 @@ _NON_ALNUM_RE = re.compile(r"[^a-z0-9]")
 # _build_mq_broker_companion_blocks().
 _MQ_BROKER_TYPE = "aws_mq_broker"
 
+# Real bug found 2026-08-24 per an explicit user question ("why is this
+# asked as a fill-in-the-blank value when it should be wired inside the
+# module and resolved by Terraform at apply time?") — she's right: a NAT
+# gateway's allocation_id (its Elastic IP) is a value Terraform can
+# allocate and resolve entirely within the SAME apply, the same way
+# aws_subnet's vpc_id or aws_lb's subnets already are, so it should never
+# have needed a user-supplied answer at all. The catalog's
+# "REPLACE_WITH_EIP_ALLOCATION_ID" placeholder (see catalog.py) had no
+# companion-resource generation behind it — unlike aws_mq_broker/aws_s3_bucket
+# above, which already use this exact companion-block mechanism for their
+# own no-sensible-static-default fields. See
+# _build_nat_gateway_companion_blocks().
+_NAT_GATEWAY_TYPE = "aws_nat_gateway"
+
 
 def _build_mq_broker_companion_blocks(terraform_name: str) -> tuple[list[str], str]:
     """
@@ -110,16 +124,69 @@ _S3_BUCKET_TYPE = "aws_s3_bucket"
 # anything at all.
 
 
-# Wires aws_lb.subnets to every aws_subnet resource actually present in the
-# diagram, instead of leaving the catalog's single-placeholder-subnet
-# default. Same motivating request as the EKS role above — "not possible to
-# pass the id values beforehand ... these should be carried out in outputs"
-# — an ALB's subnets aren't a containment relationship (it doesn't sit
-# "inside" one subnet the way an EC2 instance does), so this is a
-# post-classification sibling-reference pass over the whole diagram rather
-# than a per-node containment rule. Runs once classify_diagram has finished
-# classifying every node, since an aws_lb node earlier in diagram order may
-# reference aws_subnet nodes classified later.
+# Wires each of _MULTI_SUBNET_RESOURCE_ATTRS' attributes to every
+# aws_subnet resource actually present in the diagram, instead of leaving
+# the catalog's single-placeholder-subnet default. Same motivating request
+# as the EKS role above — "not possible to pass the id values beforehand
+# ... these should be carried out in outputs" — neither of these is a
+# containment relationship (an ALB doesn't sit "inside" one subnet the way
+# an EC2 instance does, and an Auto Scaling group doesn't either), so this
+# is a post-classification sibling-reference pass over the whole diagram
+# rather than a per-node containment rule. Runs once classify_diagram has
+# finished classifying every node, since e.g. an aws_lb node earlier in
+# diagram order may reference aws_subnet nodes classified later.
+#
+# aws_autoscaling_group.vpc_zone_identifier added 2026-08-24: found via a
+# real `terraform init` failure trail in arch2tf-product (Phase 2) — it's
+# the identical "list of every subnet in the diagram" shape as aws_lb's
+# subnets, but had no wiring pass at all, so it stayed the catalog's raw
+# placeholder list. With no wiring, arch2tf-product's generic
+# clarification fallback ended up offering it as a free-text field and
+# stringifying the Python list into literal garbage
+# (`"['subnet-00000000000000000']"`) — see that repo's
+# missing_info_detector.py/terraform_planner.py for the two-sided
+# defensive fix there. Generalized this single function (was
+# `_wire_lb_subnets`, aws_lb-only) rather than writing a near-duplicate
+# function, since the logic — "every subnet in the diagram, as a list" —
+# is identical for both resource types.
+_MULTI_SUBNET_RESOURCE_ATTRS: dict[str, str] = {
+    "aws_lb": "subnets",
+    "aws_autoscaling_group": "vpc_zone_identifier",
+}
+
+# Real bug found 2026-08-24 via an actual `terraform apply` (not just
+# validate/plan — CIDR uniqueness is an AWS API-level rule, so neither
+# `terraform validate` nor `terraform plan` ever catch this; it only
+# surfaces once AWS itself rejects the CreateSubnet call): catalog.py's
+# aws_subnet default is a single static literal, `cidr_block: "10.0.1.0/24"`
+# — every subnet in a diagram that isn't itself labeled with its own bare
+# CIDR text (see `_match_by_cidr_label`) gets that exact same default, so
+# any diagram with 2+ generically-labeled subnets ("Public Subnet",
+# "Private Subnet 2", etc.) fails at apply with "CIDR ... conflicts with
+# another subnet." Fixed the same way the NAT gateway's allocation_id and
+# the multi-subnet id wiring above were: assign each affected subnet its
+# own deterministic, non-overlapping /24 instead of leaving them all on the
+# identical placeholder. Known limitation, documented rather than silently
+# guessed around: an auto-assigned range (10.0.<n>.0/24) is not checked
+# against subnets that WERE given a real CIDR via `_match_by_cidr_label` —
+# a diagram mixing explicit CIDR labels on some subnets with generic labels
+# on others could still collide in the rare case their ranges overlap.
+_DEFAULT_SUBNET_CIDR = "10.0.1.0/24"  # must match catalog.py's aws_subnet default_attributes
+
+
+def _assign_unique_subnet_cidrs(classified: list[ClassifiedResource]) -> None:
+    subnets = [r for r in classified if r.resource_type == "aws_subnet"]
+    # Only subnets still holding the untouched catalog default need
+    # reassignment — a subnet whose box was itself labeled with a real bare
+    # CIDR already has its own real value (see _match_by_cidr_label) and is
+    # left exactly as the diagram specified.
+    on_default = [r for r in subnets if r.attributes.get("cidr_block") == _DEFAULT_SUBNET_CIDR]
+    if len(on_default) <= 1:
+        return  # 0 or 1 subnet on the default — no collision possible
+    for i, r in enumerate(on_default, start=1):
+        r.attributes["cidr_block"] = f"10.0.{i}.0/24"
+
+
 def _wire_lb_subnets(classified: list[ClassifiedResource]) -> None:
     subnet_refs = [
         f"aws_subnet.{r.terraform_name}.id" for r in classified if r.resource_type == "aws_subnet"
@@ -127,8 +194,9 @@ def _wire_lb_subnets(classified: list[ClassifiedResource]) -> None:
     if not subnet_refs:
         return  # nothing in this diagram to wire to — leave the catalog placeholder
     for r in classified:
-        if r.resource_type == "aws_lb":
-            r.attributes["subnets"] = subnet_refs
+        attr_name = _MULTI_SUBNET_RESOURCE_ATTRS.get(r.resource_type)
+        if attr_name:
+            r.attributes[attr_name] = subnet_refs
 
 
 # Same sibling-reference idea as _wire_lb_subnets, for aws_eks_node_group's
@@ -152,6 +220,62 @@ def _wire_eks_node_group_refs(classified: list[ClassifiedResource]) -> None:
             r.attributes["subnet_ids"] = subnet_refs
         if len(clusters) == 1:
             r.attributes["cluster_name"] = f"aws_eks_cluster.{clusters[0].terraform_name}.name"
+
+
+# Real diagram pattern found 2026-08-24, confirmed directly by the user
+# ("eks cluster which has 2 control plane and 2 nodes" — i.e. ONE logical
+# cluster). The standard AWS reference architecture for EKS draws the
+# single, AWS-managed control plane as one box PER AZ purely as a
+# redundancy visual — "Amazon EKS" + "Control plane" + "Control plane" (one
+# per AZ) — alongside separate "Node"/node-group boxes per AZ for the actual
+# worker capacity. Every "Control plane" box carries the same EKS icon as
+# the overall "Amazon EKS" box, so before this fix each was independently
+# classified as its OWN aws_eks_cluster — 3 clusters for what is really 1.
+# That's exactly why _wire_eks_node_group_refs' "only wire cluster_name when
+# there's exactly one cluster" safety valve above was backing off and
+# leaving cluster_name as a placeholder: not a bug in the wiring itself, but
+# in there being 3 candidate clusters instead of 1. This runs once
+# classify_diagram has classified every node (same "runs after the main
+# loop" reasoning as _wire_lb_subnets) since it needs to see every
+# aws_eks_cluster candidate at once to tell a duplicate from a genuine
+# second cluster.
+_EKS_CONTROL_PLANE_LABEL_RE = re.compile(r"^\s*control\s+plane\b", re.IGNORECASE)
+
+
+def _merge_eks_control_plane_duplicates(
+    classified: list[ClassifiedResource],
+) -> list[ClassifiedResource]:
+    clusters = [r for r in classified if r.resource_type == "aws_eks_cluster"]
+    if len(clusters) <= 1:
+        return classified  # nothing to merge
+
+    control_plane_dupes = [
+        r for r in clusters if _EKS_CONTROL_PLANE_LABEL_RE.match(r.display_label or "")
+    ]
+    control_plane_dupe_ids = {id(r) for r in control_plane_dupes}
+    non_control_plane = [r for r in clusters if id(r) not in control_plane_dupe_ids]
+
+    if non_control_plane:
+        # A genuine standalone cluster box exists (e.g. "Amazon EKS") — the
+        # "Control plane" boxes are pure redundancy visuals for THAT cluster,
+        # so drop them entirely rather than emitting duplicate resources.
+        to_drop = {id(r) for r in control_plane_dupes}
+    elif control_plane_dupes:
+        # No standalone box at all — every eks_cluster match IS itself a
+        # "Control plane" box (e.g. two control-plane-only boxes, no
+        # separate overall icon). Keep the first in diagram order as the
+        # one real cluster and drop the rest, so exactly one aws_eks_cluster
+        # survives instead of zero or several.
+        to_drop = {id(r) for r in control_plane_dupes[1:]}
+    else:
+        # More than one aws_eks_cluster and none look like the "Control
+        # plane" redundancy-visual pattern — a genuine multi-cluster diagram
+        # (or an unrecognized label variant). Leave as-is: still ambiguous,
+        # still safer left to the existing placeholder + user review than
+        # guessed away.
+        return classified
+
+    return [r for r in classified if id(r) not in to_drop]
 
 
 def _build_s3_bucket_companion_blocks(terraform_name: str) -> list[str]:
@@ -258,6 +382,142 @@ def _build_s3_bucket_companion_blocks(terraform_name: str) -> list[str]:
         encryption_block, public_access_block, lifecycle_block,
     ]
 
+
+def _build_nat_gateway_companion_blocks(terraform_name: str) -> tuple[list[str], str]:
+    """
+    Returns (companion HCL resource blocks, allocation_id reference to use in
+    place of the catalog's static placeholder).
+
+    A NAT gateway's allocation_id is just the id of an Elastic IP it owns —
+    unlike aws_mq_broker's password or aws_s3_bucket's KMS/versioning/
+    encryption settings, there isn't even a design choice to make here: the
+    EIP is a same-module, same-apply resource with one obviously correct
+    shape (domain = "vpc", nothing else configurable that matters). Named
+    off the NAT gateway's own terraform_name so multiple NAT gateways in one
+    diagram (one per AZ is the common case) each get their own EIP instead
+    of colliding on a duplicate resource name.
+    """
+    eip_name = f"{terraform_name}_eip"
+
+    eip_block = (
+        f'# Auto-generated: {_NAT_GATEWAY_TYPE} needs an Elastic IP allocation_id.\n'
+        f'# Provisioned here in the same module/apply instead of asking for a\n'
+        f'# pre-existing allocation id up front.\n'
+        f'resource "aws_eip" "{eip_name}" {{\n'
+        f'  domain = "vpc"\n'
+        f'}}'
+    )
+
+    allocation_id_ref = f"aws_eip.{eip_name}.id"
+    return [eip_block], allocation_id_ref
+
+
+# Real bug found 2026-08-24, same `terraform apply` as the subnet CIDR
+# collision above: her diagram (the standard EKS reference layout) has no
+# Internet Gateway icon drawn at all — arch2terraform only ever classifies
+# aws_internet_gateway/aws_route_table from an explicit icon/label match,
+# there is no companion generation for either. A NAT gateway REQUIRES an
+# Internet Gateway attached to its VPC to leave the "pending"/"failed"
+# state (AWS checks this at the API level before the NAT gateway can
+# become available), which is exactly the "Gateway.NotAttached" error she
+# hit — plan/validate never catch it since it's an AWS business rule, not
+# an HCL schema rule. An Internet Gateway (and the route tables wiring
+# public subnets to it / private subnets to the NAT gateway) is exactly as
+# implicit and non-optional as the NAT gateway's own EIP above, so it gets
+# the same treatment: auto-provisioned rather than left for the user to
+# draw a box for.
+#
+# Known, documented scope limits (consistent with this file's other
+# companion-block functions calling out what they don't handle):
+#   - Assumes a single VPC per diagram, same as the existing
+#     _wire_lb_subnets/_wire_eks_node_group_refs sibling-reference passes —
+#     classifier.py has no per-VPC containment resolution at this stage
+#     (that's resolver.py's job, and it runs AFTER classification).
+#   - "Public" vs "private" is decided by substring match on the subnet's
+#     own terraform_name/display_label (the diagram's actual convention in
+#     every case seen so far — "Public Subnet"/"Private Subnet"). A subnet
+#     named without either word defaults to the private route table (no
+#     accidental internet exposure) rather than being guessed public.
+#   - Multiple NAT gateways (one per AZ, the common HA pattern — her
+#     diagram has 2) are paired to private subnets by diagram order/index
+#     rather than true AZ matching, since AZ-level containment isn't
+#     resolved yet at this stage either. An exact 1:1 count still produces
+#     the intended per-AZ pairing; a mismatched count falls back to modulo
+#     wraparound so nothing is left unrouted.
+_PUBLIC_SUBNET_LABEL_RE = re.compile(r"\bpublic\b", re.IGNORECASE)
+_PRIVATE_SUBNET_LABEL_RE = re.compile(r"\bprivate\b", re.IGNORECASE)
+
+
+def _wire_implicit_internet_gateway(classified: list[ClassifiedResource]) -> None:
+    vpcs = [r for r in classified if r.resource_type == "aws_vpc"]
+    subnets = [r for r in classified if r.resource_type == "aws_subnet"]
+    nat_gateways = [r for r in classified if r.resource_type == _NAT_GATEWAY_TYPE]
+    already_has_igw = any(r.resource_type == "aws_internet_gateway" for r in classified)
+
+    if not vpcs or not subnets or already_has_igw:
+        return  # nothing to attach to, nothing needing routing, or already drawn explicitly
+
+    vpc = vpcs[0]
+    igw_name = f"{vpc.terraform_name}_igw"
+    igw_block = (
+        f'# Auto-generated: this VPC has subnets but the diagram had no\n'
+        f'# Internet Gateway of its own — required for a NAT gateway to\n'
+        f'# leave "pending" and for public subnets to reach the internet.\n'
+        f'resource "aws_internet_gateway" "{igw_name}" {{\n'
+        f'  vpc_id = aws_vpc.{vpc.terraform_name}.id\n'
+        f'}}'
+    )
+    companion_blocks = [igw_block]
+
+    def label_of(r: ClassifiedResource) -> str:
+        return f"{r.display_label} {r.terraform_name}"
+
+    public_subnets = [r for r in subnets if _PUBLIC_SUBNET_LABEL_RE.search(label_of(r))]
+    public_subnet_ids = {id(r) for r in public_subnets}
+    private_subnets = [r for r in subnets if id(r) not in public_subnet_ids]
+
+    if public_subnets:
+        public_rt_name = f"{vpc.terraform_name}_public_rt"
+        companion_blocks.append(
+            f'resource "aws_route_table" "{public_rt_name}" {{\n'
+            f'  vpc_id = aws_vpc.{vpc.terraform_name}.id\n'
+            f'  route {{\n'
+            f'    cidr_block = "0.0.0.0/0"\n'
+            f'    gateway_id = aws_internet_gateway.{igw_name}.id\n'
+            f'  }}\n'
+            f'}}'
+        )
+        for r in public_subnets:
+            companion_blocks.append(
+                f'resource "aws_route_table_association" "{r.terraform_name}_assoc" {{\n'
+                f'  subnet_id      = aws_subnet.{r.terraform_name}.id\n'
+                f'  route_table_id = aws_route_table.{public_rt_name}.id\n'
+                f'}}'
+            )
+
+    if private_subnets and nat_gateways:
+        for i, r in enumerate(private_subnets):
+            nat = nat_gateways[i % len(nat_gateways)]
+            private_rt_name = f"{r.terraform_name}_private_rt"
+            companion_blocks.append(
+                f'resource "aws_route_table" "{private_rt_name}" {{\n'
+                f'  vpc_id = aws_vpc.{vpc.terraform_name}.id\n'
+                f'  route {{\n'
+                f'    cidr_block     = "0.0.0.0/0"\n'
+                f'    nat_gateway_id = aws_nat_gateway.{nat.terraform_name}.id\n'
+                f'  }}\n'
+                f'}}'
+            )
+            companion_blocks.append(
+                f'resource "aws_route_table_association" "{r.terraform_name}_assoc" {{\n'
+                f'  subnet_id      = aws_subnet.{r.terraform_name}.id\n'
+                f'  route_table_id = aws_route_table.{private_rt_name}.id\n'
+                f'}}'
+            )
+
+    vpc.companion_blocks = list(vpc.companion_blocks) + companion_blocks
+
+
 # Container types that are AWS's implicit structural boundaries rather than
 # provisionable resources:
 #   - AWS Cloud is just the outer partition boundary every diagram has — there
@@ -351,9 +611,18 @@ def classify_diagram(diagram: ParsedDiagram) -> tuple[list[ClassifiedResource], 
                     user_block["password"] = password_ref
         elif definition.terraform_type == _S3_BUCKET_TYPE:
             companion_blocks = _build_s3_bucket_companion_blocks(tf_name)
+        elif definition.terraform_type == _NAT_GATEWAY_TYPE:
+            companion_blocks, nat_allocation_id_ref = _build_nat_gateway_companion_blocks(tf_name)
 
         attributes = dict(definition.default_attributes)
         attributes.update(attribute_overrides)
+
+        # Override AFTER attribute_overrides so the auto-provisioned EIP wins
+        # over the catalog's "REPLACE_WITH_EIP_ALLOCATION_ID" placeholder
+        # even if some upstream stage already surfaced that placeholder as
+        # an override.
+        if definition.terraform_type == _NAT_GATEWAY_TYPE:
+            attributes["allocation_id"] = nat_allocation_id_ref
 
         classified.append(
             ClassifiedResource(
@@ -371,8 +640,11 @@ def classify_diagram(diagram: ParsedDiagram) -> tuple[list[ClassifiedResource], 
             )
         )
 
+    classified = _merge_eks_control_plane_duplicates(classified)
+    _assign_unique_subnet_cidrs(classified)
     _wire_lb_subnets(classified)
     _wire_eks_node_group_refs(classified)
+    _wire_implicit_internet_gateway(classified)
     return classified, unclassified
 
 

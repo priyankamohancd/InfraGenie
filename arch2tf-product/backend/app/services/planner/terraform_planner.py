@@ -67,6 +67,34 @@ _CONTAINMENT_WIRING_RULES: dict[str, tuple[str, str]] = {
     "aws_nat_gateway": ("subnet_id", "aws_subnet"),
 }
 
+# AWS-provider resource types that do NOT accept a flat `tags = {...}` map —
+# see _resource_block_lines' tags section below for the real bug this fixes.
+# aws_autoscaling_group is a confirmed, real AWS-provider exception (only
+# repeatable `tag { }` blocks are supported); add another type here only
+# after confirming the same "Unsupported argument" failure for it via a real
+# `terraform validate` run, not by guessing.
+_TAG_BLOCK_RESOURCE_TYPES: frozenset[str] = frozenset({
+    "aws_autoscaling_group",
+})
+
+# Resource type pairs that already get an implicit, fixed-direction
+# attribute-reference dependency wired by arch2terraform's classifier
+# (a "sibling reference" — not containment, since neither box is drawn
+# inside the other, but still a real one-way HCL reference set regardless
+# of which way the diagram's arrow points). See _generate_module_hcl's
+# depends_on-building loop below for the real bug this fixes, found
+# 2026-08-24: a diagram's EKS-cluster→EKS-node-group arrow produced an
+# explicit depends_on in the OPPOSITE direction from
+# arch2terraform.classifier._wire_eks_node_group_refs's implicit
+# `cluster_name = aws_eks_cluster.<x>.name` reference, so Terraform saw
+# both "cluster depends on node group" (explicit) and "node group depends
+# on cluster" (implicit) — a real two-resource cycle, not a naming issue.
+# Add a pair here whenever a new _wire_*_refs-style sibling-reference
+# function is added to arch2terraform's classifier.
+_SIBLING_REFERENCE_PAIRS: frozenset[frozenset[str]] = frozenset({
+    frozenset({"aws_eks_cluster", "aws_eks_node_group"}),
+})
+
 @dataclass(frozen=True)
 class _CrossModuleWire:
     """
@@ -220,6 +248,15 @@ async def build_terraform_plan(
     # resource landed in) and before HCL generation for any module.
     wiring_warnings, cross_module_wires = _wire_containment_attrs(module_resources, parsed)
 
+    # Same reasoning, extended to LIST-valued sibling-reference attributes
+    # (aws_lb.subnets, aws_eks_node_group.subnet_ids) that
+    # _wire_containment_attrs doesn't cover — see _wire_multi_subnet_refs'
+    # docstring for the real "Reference to undeclared resource" bug this
+    # fixes. Mutates the SAME cross_module_wires set _wire_containment_attrs
+    # just returned, so both kinds of wires get the output/variable/
+    # module-argument plumbing generated together below.
+    wiring_warnings.update(_wire_multi_subnet_refs(module_resources, cross_module_wires))
+
     # Security engine: derives security-group rules and least-privilege IAM
     # policies from the whole resource graph — genuinely separate from the
     # per-node generation below, since it needs no explicit security-group
@@ -338,6 +375,27 @@ def _generate_module_hcl(
     # instead (folding them into this generic depends_on logic would be
     # backwards: a VPC doesn't depend_on its subnet, and doing so would create
     # a circular reference once the subnet's vpc_id attribute references the VPC).
+    #
+    # Real bug found 2026-08-24 via an actual `terraform init` cycle error
+    # ("Cycle: module.containers.aws_eks_node_group..., module.containers.
+    # aws_eks_cluster..."): the SAME class of problem this containment
+    # exclusion already guards against also applies to
+    # _SIBLING_REFERENCE_PAIRS (defined near _CONTAINMENT_WIRING_RULES above)
+    # — connection types that, like containment, are NOT drawn as "the box
+    # sits inside the other box" but
+    # still get an implicit attribute-reference dependency wired in one
+    # fixed direction by arch2terraform's classifier (e.g.
+    # _wire_eks_node_group_refs sets the node group's cluster_name to
+    # `aws_eks_cluster.<x>.name`, unconditionally node-group-depends-on-
+    # cluster). A diagram author's arrow between an EKS cluster and its node
+    # group has no reason to point in that same fixed direction — this
+    # diagram's arrow went cluster → node group, so this generic depends_on
+    # builder added `depends_on = [aws_eks_node_group...]` onto the
+    # *cluster*, while cluster_name simultaneously made the node group
+    # depend on the cluster: a genuine two-resource cycle, not a naming
+    # issue. Excluding these pairs here (regardless of which way the
+    # diagram's arrow points) leaves the one correct, already-wired
+    # dependency direction as the only one Terraform sees.
     resource_ids = {r.id for r in resources}
     relevant_conns = [
         c for c in diagram.connections
@@ -366,6 +424,16 @@ def _generate_module_hcl(
             tgt = next((r for r in resources if r.id == conn.target_id), None)
             src = next((r for r in resources if r.id == conn.source_id), None)
             if tgt and src:
+                # Skip pairs that already have an implicit, fixed-direction
+                # attribute-reference dependency wired elsewhere (see the
+                # 2026-08-24 comment on _SIBLING_REFERENCE_PAIRS above) — an
+                # explicit depends_on here can point the opposite way from
+                # that implicit reference depending on which way the
+                # diagram's arrow happens to be drawn, producing a real
+                # Terraform dependency cycle rather than a duplicate/no-op.
+                pair = frozenset((src.aws_resource_type, tgt.aws_resource_type))
+                if pair in _SIBLING_REFERENCE_PAIRS:
+                    continue
                 dep_map[src.id].append(
                     f"{tgt.aws_resource_type}.{tgt.logical_name}"
                 )
@@ -539,16 +607,47 @@ def _resource_block_lines(
     # AWS cost-allocation practice), not just linter appeasement — it just
     # also happens to resolve the warning as a side effect wherever a
     # module has real resources to tag.
-    body_lines += [
-        "",
-        "  tags = merge(var.common_tags, {",
-        f'    Name        = "{resource.label}"',
-        f'    Module      = "{resource.aws_resource_type}"',
-        "    Environment = var.environment",
-        "    Project     = var.project",
-        "    Region      = var.aws_region",
-        "  })",
-    ]
+    #
+    # Real bug found 2026-08-24 via `terraform validate` ("An argument named
+    # 'tags' is not expected here"): a flat `tags = {...}` map is NOT valid
+    # HCL for every AWS resource type — aws_autoscaling_group is a real,
+    # confirmed AWS-provider exception (it predates provider-wide tag-map
+    # support and still only accepts repeatable `tag { key, value,
+    # propagate_at_launch }` blocks). _TAG_BLOCK_RESOURCE_TYPES below is the
+    # set of resource types this applies to; `dynamic "tag"` lets it iterate
+    # the exact same merged tag map every other resource gets, so the tag
+    # *contents* stay identical — only the HCL shape differs. Add a type
+    # here if `terraform validate` ever surfaces the same error for another
+    # resource type.
+    if resource.aws_resource_type in _TAG_BLOCK_RESOURCE_TYPES:
+        body_lines += [
+            "",
+            '  dynamic "tag" {',
+            "    for_each = merge(var.common_tags, {",
+            f'      Name        = "{resource.label}"',
+            f'      Module      = "{resource.aws_resource_type}"',
+            "      Environment = var.environment",
+            "      Project     = var.project",
+            "      Region      = var.aws_region",
+            "    })",
+            "    content {",
+            "      key                 = tag.key",
+            "      value               = tag.value",
+            "      propagate_at_launch = true",
+            "    }",
+            "  }",
+        ]
+    else:
+        body_lines += [
+            "",
+            "  tags = merge(var.common_tags, {",
+            f'    Name        = "{resource.label}"',
+            f'    Module      = "{resource.aws_resource_type}"',
+            "    Environment = var.environment",
+            "    Project     = var.project",
+            "    Region      = var.aws_region",
+            "  })",
+        ]
 
     # depends_on
     if depends_on:
@@ -699,6 +798,132 @@ def _wire_containment_attrs(
     return warnings, cross_module_wires
 
 
+# Attributes whose value is a LIST of same-module `aws_subnet.<x>.id`
+# references, set by arch2terraform's classifier-side sibling-reference
+# passes (_wire_lb_subnets, _wire_eks_node_group_refs, and — added
+# 2026-08-24 — _wire_lb_subnets' generalized aws_autoscaling_group case, all
+# in arch2terraform/classifier/classifier.py) rather than by
+# _CONTAINMENT_WIRING_RULES/_wire_containment_attrs above. Real bug found
+# 2026-08-24 via `terraform validate` ("Reference to undeclared resource"
+# on modules/compute/main.tf and modules/containers/main.tf): those
+# classifier passes assume arch2terraform's traditional single-flat-file
+# output, where a bare `aws_subnet.x.id` reference always resolves in the
+# same file. Phase 2 always puts subnets in the 'networking' module (see
+# MODULE_ASSIGNMENT) while aws_lb/aws_autoscaling_group land in 'compute'
+# and aws_eks_node_group in 'containers' — never 'networking' — so every one
+# of these references is ALWAYS cross-module in practice, yet nothing wired
+# the module var/output plumbing _wire_containment_attrs already provides
+# for single-value containment refs. _wire_multi_subnet_refs below extends
+# that same machinery to a LIST of references instead of a single one —
+# each element gets its own _CrossModuleWire when needed, since different
+# subnets in the list can (in principle) live in different modules.
+#
+# aws_autoscaling_group's vpc_zone_identifier added 2026-08-24: found via a
+# real `terraform init` failure trail that led one level deeper than the
+# module-wiring gap this dict already covers — the classifier had NO
+# sibling-reference pass for it at all (unlike aws_lb.subnets), so it stayed
+# the catalog's raw placeholder list, fell through
+# missing_info_detector.py's generic "ask everything" fallback (no bespoke
+# MANDATORY_FIELDS entry for it), got surfaced as a free-text clarification
+# field, and a Python list stringified into a text-field default
+# (`str(["subnet-..."])`) produced literal garbage
+# (`"['subnet-00000000000000000']"`) as the field's value once applied. See
+# arch2terraform's classifier.py and missing_info_detector.py's own
+# 2026-08-24 comments for the two-sided fix (real wiring at the source,
+# plus a defensive guard against the same class of bug for any other
+# list-valued catalog default).
+_MULTI_SUBNET_REF_ATTRS: dict[str, str] = {
+    "aws_lb": "subnets",
+    "aws_eks_node_group": "subnet_ids",
+    "aws_autoscaling_group": "vpc_zone_identifier",
+}
+
+_SUBNET_REF_RE = re.compile(r"^aws_subnet\.([A-Za-z0-9_]+)\.id$")
+
+
+def _wire_multi_subnet_refs(
+    module_resources: dict[str, list[ParsedResource]],
+    cross_module_wires: set[_CrossModuleWire],
+) -> dict[str, str]:
+    """
+    Mutates each ParsedResource's `properties` in place: for the
+    _MULTI_SUBNET_REF_ATTRS attributes, rewrites each list element that's a
+    bare same-module-assuming `aws_subnet.<x>.id` reference into a
+    `var.<name>` cross-module wire when the referencing resource landed in a
+    different module than that subnet (which — see the module comment above
+    — is always true for aws_lb.subnets and aws_eks_node_group.subnet_ids
+    today, but this checks properly rather than assuming it, so it stays
+    correct if that ever changes). Elements that aren't recognized
+    `aws_subnet.<x>.id` strings (already a `var.*` reference, or a raw
+    literal placeholder id) are left untouched.
+
+    Must run after module_resources is fully built (same ordering
+    requirement as _wire_containment_attrs) and mutates the SAME
+    cross_module_wires set that function returns, so both sets of wires get
+    the output/variable/module-argument plumbing generated together.
+
+    Returns {resource_id: comment}, same shape and purpose as
+    _wire_containment_attrs' `warnings` return value.
+    """
+    resource_module: dict[str, str] = {
+        r.id: mod for mod, rs in module_resources.items() for r in rs
+    }
+    subnets_by_logical_name: dict[str, ParsedResource] = {
+        r.logical_name: r
+        for rs in module_resources.values()
+        for r in rs
+        if r.aws_resource_type == "aws_subnet"
+    }
+
+    warnings: dict[str, str] = {}
+
+    for module_name, resources in module_resources.items():
+        for resource in resources:
+            attr_name = _MULTI_SUBNET_REF_ATTRS.get(resource.aws_resource_type)
+            if not attr_name:
+                continue
+            value = resource.properties.get(attr_name)
+            if not isinstance(value, list):
+                continue
+
+            new_value = []
+            wired_from: list[str] = []
+            changed = False
+            for item in value:
+                match = _SUBNET_REF_RE.match(item) if isinstance(item, str) else None
+                subnet = subnets_by_logical_name.get(match.group(1)) if match else None
+                if not subnet:
+                    new_value.append(item)  # not a recognized same-module subnet ref — leave as-is
+                    continue
+
+                subnet_module = resource_module.get(subnet.id)
+                if subnet_module == module_name:
+                    new_value.append(item)  # already same-module, valid as a literal reference
+                    continue
+
+                wire = _CrossModuleWire(
+                    parent_module=subnet_module,
+                    parent_resource_type="aws_subnet",
+                    parent_logical_name=subnet.logical_name,
+                    child_module=module_name,
+                )
+                cross_module_wires.add(wire)
+                new_value.append(f"var.{wire.variable_name}")
+                wired_from.append(subnet.label or subnet.logical_name)
+                changed = True
+
+            if changed:
+                resource.properties[attr_name] = new_value
+                warnings[resource.id] = (
+                    f"{attr_name} includes subnet(s) {', '.join(wired_from)} wired from the "
+                    f"'networking' module via cross-module variable(s) — see the '{module_name}' "
+                    f"module's variables.tf and the root module's module \"{module_name}\" block "
+                    f"for the full cross-module wiring"
+                )
+
+    return warnings
+
+
 def _wire_role_attachments(
     module_resources: dict[str, list[ParsedResource]],
     attachment_specs: list[dict],
@@ -826,11 +1051,25 @@ def _wire_sg_attachments(
 def _hcl_type_for(value) -> str:
     """Maps a Python value's type to the Terraform `variable` block's `type`
     argument. Order matters: bool must be checked before (int, float) since
-    `isinstance(True, int)` is True in Python."""
+    `isinstance(True, int)` is True in Python.
+
+    Real bug found 2026-08-24 via an actual `terraform validate` failure
+    ("Inappropriate value for attribute vpc_zone_identifier: set of string
+    required, but have string"): a catalog default like
+    aws_autoscaling_group's vpc_zone_identifier is a Python LIST
+    (["subnet-..."]) — this function had no case for that, so it fell
+    through to the final `return "string"`, declaring the variable as a
+    scalar string when the resource actually needs a list. Every current
+    catalog list-typed default is a list of plain id/ARN strings (no nested
+    lists/dicts), so `list(string)` is correct for all of them today; this
+    intentionally does NOT try to handle list-of-non-string or nested
+    structures, since nothing in the catalog produces those yet."""
     if isinstance(value, bool):
         return "bool"
     if isinstance(value, (int, float)):
         return "number"
+    if isinstance(value, list):
+        return "list(string)"
     return "string"
 
 
@@ -840,13 +1079,52 @@ def _hcl_default_literal(value, hcl_type: str) -> str:
     uses for resource attributes (bare true/false, bare numbers, quoted +
     escaped strings) — kept as a small local helper rather than importing
     hcl_value() since variable defaults are a Phase 2-only concern (see this
-    module's docstring) and don't need nested-block/list handling."""
+    module's docstring).
+
+    Real bug found 2026-08-24 alongside _hcl_type_for's list fix: this used
+    to have no list case either, so a list value fell into the final
+    "stringify and quote the whole thing" branch — `str(["subnet-x"])`
+    quoted as a single string, `"['subnet-x']"`, which is not valid HCL list
+    syntax at all (and wouldn't even be a valid single string value for a
+    list-typed variable). Renders each element as its own quoted+escaped
+    string, matching hcl_value()'s list handling for resource attributes."""
     if hcl_type == "bool":
         return "true" if value else "false"
     if hcl_type == "number":
         return str(value)
+    if hcl_type == "list(string)":
+        quoted_items = []
+        for v in value:
+            escaped_item = str(v).replace('"', '\\"')
+            quoted_items.append(f'"{escaped_item}"')
+        return f"[{', '.join(quoted_items)}]"
     escaped = str(value).replace('"', '\\"')
     return f'"{escaped}"'
+
+
+# Names Terraform reserves and refuses to allow as a `variable` block's
+# name ("Error: Invalid variable name") — a fixed list, not something a
+# generated diagram label could ever legitimately need, so blocking all of
+# them up front is safe. Real bug found 2026-08-24 via an actual
+# `terraform init` failure ("Invalid variable name on
+# modules/containers/va[riables.tf]"): missing_info_detector.py's
+# aws_eks_cluster field_key was renamed from "kubernetes_version" to
+# "version" so the generated RESOURCE ATTRIBUTE would match the real AWS
+# provider argument name (see that file's 2026-08-24 comment) — correct for
+# the resource block, but _variableize_mandatory_fields below defaults the
+# VARIABLE name to the same field_key, and "version" collides with this
+# reserved list (it was the legacy `module` block's source-versioning
+# argument). Guarding here, generically, rather than special-casing
+# "version" alone: field_key (the resource attribute name, must match the
+# AWS provider's real argument) and var_name (the Terraform variable
+# identifier) are already independent per-value in this function — nothing
+# requires them to be the same string — so any FUTURE MANDATORY_FIELDS
+# entry that happens to pick a reserved word hits this same guard instead
+# of silently reproducing this exact bug.
+_RESERVED_TF_VARIABLE_NAMES: frozenset[str] = frozenset({
+    "source", "version", "providers", "provider", "count", "for_each",
+    "lifecycle", "depends_on", "locals",
+})
 
 
 def _variableize_mandatory_fields(
@@ -912,9 +1190,21 @@ def _variableize_mandatory_fields(
                 if isinstance(value, str) and value.startswith("var."):
                     continue
 
+                # field_key becomes the literal resource ATTRIBUTE name
+                # below (resource.properties[field_key] = ...) and must
+                # match the real AWS provider argument — var_name is the
+                # separate Terraform VARIABLE identifier and has no such
+                # constraint, so a reserved word here gets a safe suffix
+                # rather than reusing field_key as-is. See
+                # _RESERVED_TF_VARIABLE_NAMES's comment for the real bug
+                # this fixes ("version" as a field_key producing an invalid
+                # `variable "version"` block).
                 var_name = field_key
+                if var_name in _RESERVED_TF_VARIABLE_NAMES:
+                    var_name = f"{field_key}_value"
+
                 if var_name in assigned_values and assigned_values[var_name] != value:
-                    base_name = f"{field_key}_{resource.logical_name}"
+                    base_name = f"{var_name}_{resource.logical_name}"
                     var_name = base_name
                     suffix = 2
                     while var_name in assigned_values and assigned_values[var_name] != value:

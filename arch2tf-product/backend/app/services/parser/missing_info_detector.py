@@ -100,8 +100,20 @@ MANDATORY_FIELDS: dict[str, list[tuple]] = {
          ["cache.t3.micro","cache.t3.small","cache.r5.large"], "cache.t3.micro"),
         ("num_cache_nodes", "Number of cache nodes?", "number", [], "1"),
     ],
+    # Real bug found 2026-08-24 via `terraform validate` ("An argument named
+    # 'kubernetes_version' is not expected here"): the field_key here isn't
+    # just an internal label — terraform_planner.py's
+    # _variableize_mandatory_fields bakes it straight in as the literal HCL
+    # attribute name on the generated resource block (see
+    # _resource_block_lines: resource.properties' keys become the block's
+    # `key = value` lines directly). aws_eks_cluster's real AWS-provider
+    # argument for this is `version`, not `kubernetes_version` — using the
+    # wrong key here meant every generated EKS cluster failed
+    # `terraform validate` outright. The question text stays
+    # human-readable; only the field_key (which doubles as the emitted
+    # attribute name and the `var.<name>` variable name) changed.
     "aws_eks_cluster": [
-        ("kubernetes_version", "Kubernetes version for {label}?", "select",
+        ("version", "Kubernetes version for {label}?", "select",
          ["1.28","1.29","1.30"], "1.29"),
     ],
     "aws_lambda_function": [
@@ -386,6 +398,26 @@ def detect_missing_info(
                 continue  # already auto-wired to a real resource reference — nothing to ask
             if _MANDATORY_ROLE_WIRED_FIELD_BY_RESOURCE_TYPE.get(resource.aws_resource_type) == prop_key:
                 continue  # always overwritten later by the security engine's generated role — nothing to ask
+            if isinstance(prop_val, list):
+                # Real bug found 2026-08-24 via `terraform init` ("Invalid
+                # variable name"/type-mismatch trail that traced back to
+                # this exact spot): a list-valued catalog default (e.g.
+                # aws_autoscaling_group's vpc_zone_identifier, a list of
+                # subnet ids) reaching this generic fallback got offered as
+                # an `input_type="text"` field with `default=str(prop_val)`
+                # a few lines below — str()'ing a Python list produces
+                # `"['subnet-...']"`, which is neither a valid single
+                # subnet id nor anything a one-line text box can sensibly
+                # edit. A resource type with a real diagram-driven wiring
+                # pass for this attribute (see arch2terraform's
+                # _wire_lb_subnets/_wire_eks_node_group_refs) never reaches
+                # here at all — _looks_like_wired_reference already skips
+                # those above once wired. This is the fallback for when no
+                # such wiring pass exists yet (or the diagram genuinely has
+                # nothing to wire it to): leave the catalog placeholder list
+                # as a literal rather than asking a question that can only
+                # produce a worse value than what's already there.
+                continue
             is_catalog_default = (
                 prop_key in catalog_default_keys
                 and prop_key not in _NEVER_ASK_CATALOG_DEFAULTS

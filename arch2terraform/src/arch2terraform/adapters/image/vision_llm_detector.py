@@ -95,7 +95,32 @@ _VALID_TERRAFORM_TYPES = frozenset(d.terraform_type for d in CATALOG)
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-sonnet-5"
-DEFAULT_MAX_TOKENS = 8192
+
+# Real bug found 2026-08-25, root-caused via the diagnostic logging in
+# _default_call_vision_api below: a complex diagram made the model spend its
+# ENTIRE token budget on an internal "thinking" block and hit `max_tokens`
+# before ever producing the actual JSON text — confirmed directly from a
+# live log line: `stop_reason='max_tokens', content block types=['thinking'],
+# block count=1`. Not a diagram-specific fluke; any sufficiently complex
+# diagram can reproduce this the same way. Her explicit choice (asked
+# directly, not assumed, since it trades reasoning quality on ambiguous
+# diagrams against latency/cost): keep thinking enabled — it's genuinely
+# useful for this task's harder judgment calls (e.g. telling an EKS cluster
+# apart from its own worker nodes) — but bound it so it can never again
+# starve the actual output.
+#
+# The first attempt at that (classic `thinking: {"type": "enabled",
+# "budget_tokens": N}`) was itself rejected by a live 400 from the API:
+# '"thinking.type.enabled" is not supported for this model. Use
+# "thinking.type.adaptive" and "output_config.effort" to control thinking
+# behavior.' — "claude-sonnet-5" (this project's DEFAULT_MODEL) uses a
+# newer, qualitative control surface instead of an exact token budget: see
+# _default_call_vision_api's `thinking`/`output_config` params below. Same
+# lesson as this file's existing `temperature` comment further down —
+# newer model generations keep replacing exact sampling/budget knobs with
+# higher-level ones, so don't assume an older parameter shape still works
+# without checking the actual error the API gives back.
+DEFAULT_MAX_TOKENS = 16000
 
 # Element types the LLM may emit. "group" is deliberately distinct from
 # "container": a container is a real AWS network boundary (VPC, subnet, AZ,
@@ -253,10 +278,33 @@ def _default_call_vision_api(
     import anthropic
 
     client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
+    # Bounded thinking, added 2026-08-25 — see the module-level comment above
+    # DEFAULT_MAX_TOKENS for the real failure this fixes (a complex diagram
+    # made the model spend the ENTIRE max_tokens budget on thinking and never
+    # produce the JSON output at all) and why this specific shape (adaptive +
+    # effort, not a raw token budget) is what "claude-sonnet-5" actually
+    # accepts — confirmed via a live 400 naming this exact fix. "medium"
+    # effort matches her explicit choice to keep thinking's reasoning
+    # benefit for ambiguous diagrams rather than disable it outright, without
+    # going as far as "high"/"xhigh"/"max" and re-risking a similar
+    # thinking-heavy response on a very complex diagram.
     response = client.messages.create(
         model=model,
         max_tokens=max_tokens,
-        temperature=0,  # deterministic-as-possible structured extraction, not creative generation
+        thinking={"type": "adaptive"},
+        output_config={"effort": "medium"},
+        # `temperature` deliberately NOT set: the original intent (pinning
+        # it to 0 for deterministic-as-possible structured extraction) is
+        # sound, but "claude-sonnet-5" (this project's DEFAULT_MODEL, and
+        # the model actually used here) rejects the parameter outright —
+        # confirmed 2026-08-20 via a real 400 invalid_request_error,
+        # "`temperature` is deprecated for this model." Newer model
+        # generations increasingly don't accept sampling-parameter
+        # overrides at all, so passing ANY value (0 or otherwise) breaks
+        # the call rather than just changing its behavior. If a future
+        # model/version genuinely needs an explicit temperature to get
+        # low-variance JSON extraction, gate it per-model rather than
+        # hardcoding it for every model this function might be pointed at.
         messages=[
             {
                 "role": "user",
@@ -270,7 +318,29 @@ def _default_call_vision_api(
             }
         ],
     )
-    return "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
+    text = "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
+
+    # Diagnostic added 2026-08-25: the caller (detect_via_vision_llm) only
+    # sees this function's return value, so when it comes back empty all it
+    # can report is "Vision LLM returned an empty response" — true, but
+    # useless for root-causing, since the API call itself didn't raise and
+    # this function silently dropped anything that wasn't a "text" block.
+    # Logging stop_reason + every content block's actual type here, right at
+    # the source, is the only place that information still exists — the
+    # `response` object itself is never returned or kept anywhere else.
+    # Reproduced twice in a row against the same image (not a one-off
+    # transient blip), so whatever this logs next time should be a real,
+    # actionable cause instead of another guess.
+    if not text.strip():
+        block_types = [getattr(block, "type", "unknown") for block in response.content]
+        logger.warning(
+            "[Vision LLM] API call returned no usable text — stop_reason=%r, "
+            "content block types=%r, block count=%d, model=%r, max_tokens=%r",
+            getattr(response, "stop_reason", None), block_types, len(response.content),
+            model, max_tokens,
+        )
+
+    return text
 
 
 # ---------------------------------------------------------------------------
